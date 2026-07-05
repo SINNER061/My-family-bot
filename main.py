@@ -22,6 +22,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
@@ -108,6 +109,9 @@ _MAX_RETRY_DELAY       = 120    # seconds (exponential back-off ceiling)
 _CONFLICT_WAIT         = 35     # seconds to wait after a 409 Conflict
 _MAX_CONSECUTIVE_FAILS = 20     # give up after this many back-to-back crashes
 
+# Signals main loop to exit cleanly when InvalidToken is detected inside async context
+_invalid_token_flag = threading.Event()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. BOT HANDLERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -182,10 +186,13 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
         await asyncio.sleep(_CONFLICT_WAIT)
         return
 
-    # [FIX #3] Bad token — no point retrying
+    # [FIX #3] Bad token — signal main loop via flag instead of sys.exit() in async context
     if isinstance(err, InvalidToken):
-        logger.critical("InvalidToken: BOT_TOKEN is wrong. Fix it in Secrets then restart.")
-        sys.exit(1)
+        logger.critical(
+            "InvalidToken: BOT_TOKEN is wrong. Fix it in Secrets then restart."
+        )
+        _invalid_token_flag.set()   # triggers clean exit in _run_bot_once()
+        return
 
     if isinstance(err, RetryAfter):
         logger.warning("Rate-limited — sleeping %.0f s.", err.retry_after)
@@ -299,11 +306,24 @@ async def _run_bot_once() -> None:
             _heartbeat_task(), name="heartbeat",
         )
 
-        # Main wait loop — wakes every second to check watchdog flag
+        # Main wait loop — wakes every second to check watchdog flag and polling health
         while True:
             await asyncio.sleep(1)
+
+            # [review fix #2] InvalidToken detected asynchronously → exit immediately
+            if _invalid_token_flag.is_set():
+                logger.critical("InvalidToken flag set — exiting.")
+                sys.exit(1)
+
+            # [review fix #1] Verify polling is actually running, not just heartbeat
+            if not application.updater.running:
+                logger.error(
+                    "Updater polling has stopped unexpectedly — triggering restart."
+                )
+                keep_alive.request_restart(reason="updater.running=False")
+
             if keep_alive.clear_restart_flag():
-                logger.warning("Watchdog triggered restart — stopping current run.")
+                logger.warning("Restart flag set — stopping current run.")
                 break
 
     finally:

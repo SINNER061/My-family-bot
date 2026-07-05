@@ -142,12 +142,17 @@ def _run_flask() -> None:
 
 
 # ── Health watchdog ───────────────────────────────────────────────────────────
-_HEARTBEAT_TIMEOUT   = 90    # s — no heartbeat → assume bot is stuck
-_NOT_RUNNING_TIMEOUT = 180   # s — bot hasn't started at all → also restart
+_HEARTBEAT_TIMEOUT   = 90    # s — stale heartbeat → bot is stuck
+_NOT_RUNNING_TIMEOUT = 180   # s — bot_running=False for too long → restart
 _CHECK_INTERVAL      = 30    # s between watchdog ticks
+
+# Tracks when bot_running last became False so we don't use start_time heuristic
+_not_running_since: datetime | None = None
 
 
 def _watchdog() -> None:
+    global _not_running_since
+
     logger.info(
         "Watchdog started — check every %s s, heartbeat timeout %s s.",
         _CHECK_INTERVAL, _HEARTBEAT_TIMEOUT,
@@ -157,30 +162,38 @@ def _watchdog() -> None:
     while True:
         try:
             s = get_state()
+            now = datetime.now(timezone.utc)
 
             if s["bot_running"]:
+                _not_running_since = None          # reset whenever bot is running
+
                 last_hb = s["last_heartbeat"]
                 if last_hb is None:
                     logger.warning("Watchdog: bot_running=True but no heartbeat received yet.")
                 else:
-                    age = (datetime.now(timezone.utc) - last_hb).total_seconds()
+                    age = (now - last_hb).total_seconds()
                     if age > _HEARTBEAT_TIMEOUT:
                         logger.error(
-                            "Watchdog: heartbeat is %.0f s old (max %s s) — requesting restart.",
+                            "Watchdog: heartbeat %.0f s old (limit %s s) — requesting restart.",
                             age, _HEARTBEAT_TIMEOUT,
                         )
-                        request_restart(reason=f"heartbeat timeout ({age:.0f}s)")
+                        request_restart(reason=f"heartbeat stale ({age:.0f}s)")
 
             else:
-                # Bot says it's not running — could be between restart attempts
-                start_time = s["start_time"]
-                idle = (datetime.now(timezone.utc) - start_time).total_seconds()
-                if idle > _NOT_RUNNING_TIMEOUT and s["last_heartbeat"] is None:
-                    logger.error(
-                        "Watchdog: bot never started after %.0f s — requesting restart.",
-                        idle,
-                    )
-                    request_restart(reason="bot never started")
+                # [FIX review#3] Track elapsed time since bot stopped, not since process start.
+                # This catches the case where bot ran fine, then stopped and never restarted.
+                if _not_running_since is None:
+                    _not_running_since = now
+                    logger.debug("Watchdog: bot_running=False — started idle timer.")
+                else:
+                    idle = (now - _not_running_since).total_seconds()
+                    if idle > _NOT_RUNNING_TIMEOUT:
+                        logger.error(
+                            "Watchdog: bot_running=False for %.0f s — requesting restart.",
+                            idle,
+                        )
+                        request_restart(reason=f"not running for {idle:.0f}s")
+                        _not_running_since = now   # reset so we don't spam
 
         except Exception as exc:
             logger.error("Watchdog internal error: %s", exc, exc_info=True)
