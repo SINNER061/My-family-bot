@@ -110,7 +110,7 @@ def trigger_restart():
 # ── Flask runner ──────────────────────────────────────────────────────────────
 
 def _run_flask() -> None:
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("BOT_PORT", 8000))
     logger.info("Flask keep-alive server starting on port %s", port)
     consecutive_port_errors = 0
 
