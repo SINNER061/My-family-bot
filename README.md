@@ -1,20 +1,24 @@
-# 🤖 Self-Healing Telegram Bot
+# 🤖 Self-Healing Telegram Bot — v2.0
 
-A production-ready, always-on Telegram bot built with **python-telegram-bot v21**, designed to run on **Replit** with near-zero downtime.
+A production-grade, always-on Telegram bot for **Replit** built with **python-telegram-bot v21** and full asyncio support.  
+Designed to survive crashes, network drops, Telegram rate-limits, and Replit sleep cycles — automatically.
 
 ---
 
-## ✨ Features
+## ✅ What's Fixed in v2.0
 
-| Feature | Details |
-|---|---|
-| **Self-healing** | Catches every exception, logs it, restarts automatically |
-| **Exponential back-off** | Retry delay doubles on repeated failures (max 120 s) |
-| **Health watchdog** | Background thread checks heartbeat every 30 s |
-| **Keep-alive server** | Flask endpoint answers UptimeRobot / cron-job.org pings |
-| **Rotating logs** | `bot.log` — max 5 MB × 3 backups, also prints to console |
-| **Graceful shutdown** | Handles SIGTERM and KeyboardInterrupt cleanly |
-| **Rate-limit aware** | Respects `RetryAfter` headers from Telegram |
+| # | Bug | Fix |
+|---|-----|-----|
+| 1 | `asyncio.run()` in restart loop → "Event loop is closed" errors | Each attempt uses `new_event_loop()` + explicit cleanup |
+| 2 | Conflict (409) — two instances cause retry storm | Detected, waits 35 s, restarts cleanly |
+| 3 | `InvalidToken` causes infinite retry | Detected immediately → `sys.exit(1)` with clear message |
+| 4 | `update.message` / `effective_user` = None → AttributeError crash | All handlers guard with `if not update.message: return` |
+| 5 | `SystemExit` / `KeyboardInterrupt` caught by generic except | Handled separately; propagates correctly |
+| 6 | `heartbeat_task` dies silently on any error | Wrapped in try/except; logs and continues |
+| 7 | Infinite crash-loop with no escape | `MAX_CONSECUTIVE_FAILS = 20` safety valve |
+| 8 | `poll_interval` conflicts with long-poll timeout | Removed from `start_polling`; set only on builder |
+| 9 | Race condition in `_state` dict (multi-thread) | `threading.Lock` on all reads/writes |
+| 10 | Flask retries forever on port-busy error | OSError detected; tries next port, then exits thread |
 
 ---
 
@@ -22,81 +26,13 @@ A production-ready, always-on Telegram bot built with **python-telegram-bot v21*
 
 ```
 .
-├── main.py          ← Entry point; self-healing outer loop + all bot handlers
-├── keep_alive.py    ← Flask server + health watchdog thread
+├── main.py          ← Entry point: self-healing loop + all bot handlers
+├── keep_alive.py    ← Flask server (UptimeRobot pings) + health watchdog
 ├── requirements.txt ← Python dependencies
-├── .gitignore       ← Excludes secrets, logs, caches
+├── .gitignore       ← Excludes .env, logs, __pycache__, etc.
 ├── README.md        ← This file
-└── bot.log          ← Runtime log (git-ignored)
+└── bot.log          ← Runtime log — auto-rotated, git-ignored
 ```
-
----
-
-## 🚀 Setup on Replit
-
-### 1 — Fork / Import
-
-Click **Use Template** or import this repository directly:
-
-> Replit → **Create Repl** → **Import from GitHub** → paste repo URL
-
-### 2 — Set the Bot Token Secret
-
-1. In Replit, open **Tools → Secrets** (🔒).
-2. Add a new secret:
-   - **Key:** `BOT_TOKEN`
-   - **Value:** your token from [@BotFather](https://t.me/BotFather)
-
-> ⚠️ **Never** put your token in code or commit it to Git.
-
-### 3 — Configure the Run button
-
-In Replit's `.replit` file (or **Run** settings), set:
-
-```
-run = "python main.py"
-```
-
-Or create a Shell command:
-
-```bash
-pip install -r requirements.txt && python main.py
-```
-
-### 4 — Click Run ▶️
-
-The bot starts, Flask server comes up on port `8080`, and the health watchdog kicks in after 15 s.
-
----
-
-## 🏓 Keep Alive with UptimeRobot
-
-Replit free-tier Repls sleep after ~30 minutes of inactivity.  
-Set up a free monitor on [UptimeRobot](https://uptimerobot.com) or [cron-job.org](https://cron-job.org) to ping the Flask server every **30–60 seconds**.
-
-### Get your Replit URL
-
-In the **Webview** tab, copy the URL — it looks like:
-
-```
-https://<repl-name>.<username>.repl.co
-```
-
-### UptimeRobot settings
-
-| Field | Value |
-|---|---|
-| Monitor type | HTTP(s) |
-| URL | `https://<your-repl>.repl.co/health` |
-| Interval | 30 seconds |
-
-### Available endpoints
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/` | GET | Full status JSON (uptime, heartbeat, bot_running) |
-| `/health` | GET | Simple `{"ok": true}` — use this for UptimeRobot |
-| `/restart` | POST | Trigger a manual bot restart |
 
 ---
 
@@ -105,110 +41,189 @@ https://<repl-name>.<username>.repl.co
 ```
 Replit process
 │
-├─ main.py (main thread)
-│   └─ run_forever()                ← outer while-loop (self-healing)
-│       └─ asyncio.run(run_bot_once())
-│           ├─ Telegram polling     ← python-telegram-bot Application
-│           └─ heartbeat_task()     ← async task, ticks every 20 s
+├─ main.py  (main thread)
+│   └─ _run_forever()                ← outer while-loop with back-off
+│       └─ loop.run_until_complete(_run_bot_once())
+│           ├─ Telegram polling      ← Application + Updater (PTB v21)
+│           └─ _heartbeat_task()     ← async task, ticks every 20 s
 │
-├─ Flask thread (daemon)            ← keep_alive._run_flask()
-│   └─ answers HTTP pings
+├─ Flask thread (daemon)             ← keep_alive._run_flask()
+│   └─ / · /health · /restart
 │
-└─ Watchdog thread (daemon)         ← keep_alive._watchdog()
-    └─ checks heartbeat every 30 s
-    └─ sets restart_requested=True if bot is stuck
+└─ Watchdog thread (daemon)          ← keep_alive._watchdog()
+    ├─ checks heartbeat every 30 s
+    └─ sets restart_requested if stuck or silent > 90 s
+```
+
+**Restart flow:**
+1. Watchdog sets `restart_requested = True`
+2. Main loop wakes, calls `_stop_application()` + `shutdown()`
+3. Event loop closed and recreated cleanly
+4. New `Application` built and polling resumes
+
+---
+
+## 🚀 Setup on Replit
+
+### Step 1 — Import the repository
+
+> **Create Repl → Import from GitHub** → paste the repo URL → click Import
+
+### Step 2 — Set your Bot Token (Secret)
+
+1. Open **Tools → Secrets** (🔒 icon in sidebar)
+2. Click **+ New Secret**
+   - **Key:** `BOT_TOKEN`
+   - **Value:** your token from [@BotFather](https://t.me/BotFather)
+
+> ⚠️ Never put your token directly in code or commit it to Git.
+
+### Step 3 — Set the Run command
+
+In **`.replit`** file or the Run button settings:
+```
+run = "python main.py"
+```
+
+Or in the Shell tab before clicking Run:
+```bash
+pip install -r requirements.txt
+python main.py
+```
+
+### Step 4 — Click ▶️ Run
+
+Expected startup output:
+```
+2024-01-01 12:00:00 | INFO     | bot       | ════ Self-Healing Telegram Bot — v2.0 starting ════
+2024-01-01 12:00:00 | INFO     | keep_alive| Flask keep-alive server starting on port 8080
+2024-01-01 12:00:00 | INFO     | keep_alive| Watchdog started — check every 30 s, heartbeat timeout 90 s.
+2024-01-01 12:00:01 | INFO     | bot       | ━━━ Bot start attempt #1 (consecutive_fails=0) ━━━
+2024-01-01 12:00:02 | INFO     | bot       | Bot is now polling. Ctrl+C to stop.
 ```
 
 ---
 
-## 🔧 Customisation
+## 🏓 Keep Alive with UptimeRobot
 
-### Add a new command
+Free-tier Repls sleep after ~30 minutes of inactivity. Prevent this:
 
-In `main.py`, add a handler function and register it:
+1. Go to [uptimerobot.com](https://uptimerobot.com) → **Add New Monitor**
+2. Settings:
+
+| Field | Value |
+|-------|-------|
+| Monitor Type | HTTP(s) |
+| Friendly Name | My Telegram Bot |
+| URL | `https://<your-repl>.<username>.repl.co/health` |
+| Monitoring Interval | 30 seconds |
+
+### Available HTTP endpoints
+
+| Endpoint | Method | Response |
+|----------|--------|----------|
+| `/health` | GET | `{"ok": true}` — use this for UptimeRobot |
+| `/` | GET | Full JSON status (uptime, heartbeat age, restart count) |
+| `/restart` | POST | Force an immediate bot restart |
+
+**Find your Replit URL:** look at the **Webview** tab — copy the URL shown there.
+
+---
+
+## ⚙️ Configuration Reference
+
+### main.py
 
 ```python
+_BASE_RETRY_DELAY      = 5    # seconds — initial back-off after crash
+_MAX_RETRY_DELAY       = 120  # seconds — maximum back-off ceiling
+_CONFLICT_WAIT         = 35   # seconds — wait after a 409 Conflict error
+_MAX_CONSECUTIVE_FAILS = 20   # give up after this many back-to-back failures
+```
+
+### keep_alive.py
+
+```python
+_HEARTBEAT_TIMEOUT   = 90    # seconds — no heartbeat → request restart
+_NOT_RUNNING_TIMEOUT = 180   # seconds — bot never started → request restart
+_CHECK_INTERVAL      = 30    # seconds — between watchdog ticks
+```
+
+---
+
+## 🛠️ Adding Your Own Commands
+
+```python
+# In main.py, add a handler function:
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("pong!")
+    if not update.message:
+        return
+    await update.message.reply_text("pong! 🏓")
 
-# Inside build_application():
+# Then register it inside _build_application():
 app.add_handler(CommandHandler("ping", cmd_ping))
-```
-
-### Change watchdog sensitivity
-
-In `keep_alive.py`:
-
-```python
-_HEARTBEAT_TIMEOUT = 90   # seconds — raise if your bot is slow to process
-_CHECK_INTERVAL    = 30   # seconds between watchdog checks
-```
-
-### Change back-off limits
-
-In `main.py`:
-
-```python
-_BASE_RETRY_DELAY = 5    # initial wait (seconds) after a crash
-_MAX_RETRY_DELAY  = 120  # maximum wait (seconds)
 ```
 
 ---
 
 ## 📦 GitHub Workflow
 
-### First push
-
+### First push (already done via Replit)
 ```bash
 git init
 git add .
-git commit -m "feat: initial self-healing bot"
+git commit -m "feat: self-healing bot v2.0"
 git branch -M main
 git remote add origin https://github.com/YOUR_USER/YOUR_REPO.git
 git push -u origin main
 ```
 
 ### Update after changes
-
 ```bash
 git add .
-git commit -m "fix: describe what you changed"
+git commit -m "fix: describe what changed"
 git push
 ```
 
-### Pull latest on Replit
-
+### Pull latest into Replit Shell
 ```bash
 git pull origin main
+pip install -r requirements.txt   # if dependencies changed
 ```
 
 ---
 
-## 📋 Logs
+## 📋 Reading Logs
 
-Logs are written to both the console and `bot.log` (rotated automatically).  
-`bot.log` is in `.gitignore` — never committed.
+Logs print to both console and `bot.log` (rotated at 5 MB, 3 backups kept).
 
-```
-2024-01-01 12:00:00 | INFO     | bot       | ════ Self-Healing Telegram Bot — starting
-2024-01-01 12:00:00 | INFO     | keep_alive| Flask keep-alive server starting on port 8080
-2024-01-01 12:00:01 | INFO     | bot       | Bot is polling. Press Ctrl+C to stop.
+```bash
+# Live tail in Replit Shell
+tail -f bot.log
+
+# Last 50 lines
+tail -50 bot.log
+
+# Search for errors only
+grep ERROR bot.log
 ```
 
 ---
 
 ## ⚠️ Troubleshooting
 
-| Problem | Solution |
-|---|---|
-| `BOT_TOKEN is not set` | Add `BOT_TOKEN` in Replit → Tools → Secrets |
-| Bot not responding | Check `bot.log` or Replit console for errors |
-| Port already in use | Change `PORT` env var in Replit Secrets |
-| UptimeRobot failing | Make sure the Repl is running and URL is correct |
-| `Conflict: terminated by other getUpdates` | Only one instance should run — stop duplicate Repls |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `BOT_TOKEN is not set` | Secret missing | Tools → Secrets → add `BOT_TOKEN` |
+| `InvalidToken` in logs | Wrong token | Re-generate from @BotFather |
+| `Conflict (409)` repeating | Two Repls running | Stop the other Repl/instance |
+| Bot not responding to messages | Check `bot.log` for errors | Run `grep ERROR bot.log` in Shell |
+| UptimeRobot showing down | Repl crashed or not started | Check console, click Run again |
+| Port already in use | Previous process still running | Kill it: `pkill -f main.py` |
+| `MAX_CONSECUTIVE_FAILS reached` | Persistent crash | Fix the root error, restart Repl |
 
 ---
 
 ## 📜 License
 
-MIT — use freely, attribution appreciated.
+MIT — free to use, attribution appreciated.
