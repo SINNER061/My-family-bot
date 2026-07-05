@@ -109,6 +109,17 @@ def get_owner_id() -> Optional[int]:
     return int(val) if val else None
 
 
+def claim_owner_atomic(user_id: int) -> bool:
+    """Atomically insert owner_id only if no owner exists. Returns True if this caller won."""
+    with get_db() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('owner_id', ?)",
+            (str(user_id),),
+        )
+        row = con.execute("SELECT value FROM settings WHERE key='owner_id'").fetchone()
+        return row is not None and int(row["value"]) == user_id
+
+
 # ── User helpers ──────────────────────────────────────────────────
 def upsert_user(user) -> None:
     with get_db() as con:
@@ -268,8 +279,10 @@ async def cmd_setowner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("✅ شما قبلاً مالک این ربات هستید.")
         return
 
-    # First-time claim
-    set_setting("owner_id", str(user.id))
+    # First-time claim — atomic: only one caller wins the race
+    won = claim_owner_atomic(user.id)
+    if not won:
+        return  # another concurrent request got there first — silently ignore
     set_rank(user.id, 7)  # Owner rank
     log.info("Owner set: user_id=%s (%s)", user.id, user.first_name)
     await update.message.reply_text(
@@ -395,7 +408,14 @@ async def cmd_givepoints(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     try:
         uid, amount = int(args[0]), int(args[1])
     except ValueError:
-        await update.message.reply_text("❌ مقادیر نامعتبر.")
+        await update.message.reply_text("❌ مقادیر نامعتبر. باید عدد باشند.")
+        return
+    if amount <= 0:
+        await update.message.reply_text("❌ مقدار امتیاز باید مثبت باشد.")
+        return
+    target = get_user(uid)
+    if not target:
+        await update.message.reply_text(f"❌ کاربر {uid} در دیتابیس ربات پیدا نشد.\nکاربر باید ابتدا /start را زده باشد.")
         return
     new_bal = add_points(uid, amount)
     await update.message.reply_text(
@@ -405,8 +425,8 @@ async def cmd_givepoints(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     )
     try:
         await ctx.bot.send_message(uid, f"🎁 <b>{amount:,} امتیاز</b> دریافت کردید!\nموجودی: {new_bal:,}", parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Could not notify user %s about points: %s", uid, e)
 
 
 # /setadmin [user_id]
@@ -417,13 +437,20 @@ async def cmd_setadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
         await update.message.reply_text("استفاده: /setadmin [user_id]")
         return
-    uid = int(ctx.args[0])
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id باید عدد باشد.")
+        return
+    if not get_user(uid):
+        await update.message.reply_text(f"❌ کاربر {uid} در دیتابیس یافت نشد.")
+        return
     set_admin(uid, True)
     await update.message.reply_text(f"✅ کاربر {uid} به عنوان ادمین منصوب شد.")
     try:
         await ctx.bot.send_message(uid, "🛡 شما به عنوان <b>ادمین</b> منصوب شدید!", parse_mode=ParseMode.HTML)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Could not notify admin %s: %s", uid, e)
 
 
 # /removeadmin [user_id]
@@ -434,7 +461,14 @@ async def cmd_removeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
     if not ctx.args:
         await update.message.reply_text("استفاده: /removeadmin [user_id]")
         return
-    uid = int(ctx.args[0])
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id باید عدد باشد.")
+        return
+    if not get_user(uid):
+        await update.message.reply_text(f"❌ کاربر {uid} در دیتابیس یافت نشد.")
+        return
     set_admin(uid, False)
     await update.message.reply_text(f"✅ دسترسی ادمین کاربر {uid} حذف شد.")
 
@@ -447,7 +481,11 @@ async def cmd_setvip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not ctx.args:
         await update.message.reply_text("استفاده: /setvip [user_id]")
         return
-    uid = int(ctx.args[0])
+    try:
+        uid = int(ctx.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ user_id باید عدد باشد.")
+        return
     u = get_user(uid)
     if not u:
         await update.message.reply_text("❌ کاربر پیدا نشد.")
@@ -579,15 +617,31 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
 
     elif data.startswith("buy_rank_"):
         next_idx = int(data.split("_")[-1])
+        # Server-side validation — never trust client-sent rank index
+        cur_u = get_user(user.id)  # fresh read
+        if not cur_u:
+            await q.answer("خطا: پروفایل شما یافت نشد.", show_alert=True)
+            return
+        if next_idx != cur_u["rank_idx"] + 1 or next_idx > MAX_PURCHASABLE_RANK:
+            await q.answer("درخواست نامعتبر.", show_alert=True)
+            return
         r_next = rank_info(next_idx)
         cost = r_next["points"]
-        if u["points"] < cost:
-            await q.message.edit_text("❌ امتیاز کافی ندارید.", reply_markup=back_kb())
-            return
-        # deduct points and upgrade
+        # Atomic deduct-and-upgrade: only succeeds when points still sufficient AND rank unchanged
         with get_db() as con:
-            con.execute("UPDATE users SET points = points - ?, rank_idx = ? WHERE user_id = ?",
-                        (cost, next_idx, user.id))
+            result = con.execute(
+                """UPDATE users
+                   SET points = points - ?, rank_idx = ?
+                   WHERE user_id = ? AND rank_idx = ? AND points >= ?""",
+                (cost, next_idx, user.id, cur_u["rank_idx"], cost),
+            )
+            rows_changed = result.rowcount
+        if rows_changed == 0:
+            await q.message.edit_text(
+                "❌ ارتقا انجام نشد — امتیاز کافی ندارید یا رتبه تغییر کرده.",
+                reply_markup=back_kb(),
+            )
+            return
         log.info("Rank upgrade: user_id=%s → rank %s (cost %s pts)", user.id, next_idx, cost)
         await q.message.edit_text(
             f"🎉 تبریک! به رتبه {r_next['name']} ارتقا یافتید!\n"
