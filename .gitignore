@@ -40,6 +40,9 @@ testem.log
 # System Files
 .DS_Store
 Thumbs.db
+family.db
+*.db
+bot.log
 
 .cursor/rules/nx-rules.mdc
 .github/instructions/nx.instructions.md
