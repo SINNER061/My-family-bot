@@ -1,458 +1,787 @@
 """
-main.py — Self-healing Telegram Bot  (python-telegram-bot v21, asyncio)
-
-Fixed vs. previous version
-───────────────────────────
-  [BUG #1]  asyncio.run() replaced with new_event_loop() + run_until_complete()
-            so the event loop is explicitly managed and closed cleanly on restart.
-  [BUG #2]  Conflict (409) error → waits 30 s then restarts (no retry storm).
-  [BUG #3]  InvalidToken → logs clearly and exits immediately (no endless retry).
-  [BUG #4]  All handlers guard against update.message / effective_user being None.
-  [BUG #5]  BaseException caught in outer loop so SystemExit propagates correctly.
-  [BUG #6]  heartbeat_task wrapped in try/except so it never dies silently.
-  [BUG #7]  Consecutive failure counter → exits after MAX_CONSECUTIVE_FAILURES.
-  [BUG #8]  poll_interval removed from start_polling (set on builder instead).
-  [BUG #9]  Graceful updater+application stop extracted to helper to avoid
-            calling stop() twice inside async with.
+Matrix-Family Telegram Bot — v3.0
+Self-healing · Owner security · Rank system · Points · Admin panel · SQLite
 """
 
-# ── std-lib ────────────────────────────────────────────────────────────────────
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
-import signal
+import sqlite3
 import sys
-import threading
 import time
-from datetime import datetime, timezone
-from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
-# ── third-party ────────────────────────────────────────────────────────────────
-from telegram import Update
-from telegram.error import (
-    BadRequest,
-    Conflict,
-    Forbidden,
-    InvalidToken,
-    NetworkError,
-    RetryAfter,
-    TelegramError,
-    TimedOut,
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
 )
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
+from telegram.error import Conflict, InvalidToken, NetworkError, TelegramError
 
-# ── local ──────────────────────────────────────────────────────────────────────
-import keep_alive
+from keep_alive import start_keep_alive
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. LOGGING SETUP
-# ══════════════════════════════════════════════════════════════════════════════
-LOG_FILE    = "bot.log"
-LOG_FORMAT  = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-LOG_DATE    = "%Y-%m-%d %H:%M:%S"
-LOG_MAX_MB  = 5
-LOG_BACKUPS = 3
+# ─────────────────────────── Logging ────────────────────────────
+LOG_FILE = "bot.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+log = logging.getLogger("bot")
+
+# ─────────────────────────── Config ─────────────────────────────
+BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
+DB_PATH = Path("family.db")
+
+# Rank ladder — points = incremental COST from previous rank (not cumulative)
+RANKS: list[dict] = [
+    {"name": "👤 عضو",      "emoji": "👤", "points": 0,   "special": None},
+    {"name": "🥉 برنز",     "emoji": "🥉", "points": 70,  "special": None},
+    {"name": "🥈 نقره",     "emoji": "🥈", "points": 150, "special": None},
+    {"name": "🥇 طلا",      "emoji": "🥇", "points": 300, "special": None},
+    {"name": "💎 الماس",    "emoji": "💎", "points": 500, "special": None},
+    {"name": "⭐ VIP",      "emoji": "⭐", "points": 0,   "special": "تایید توسط لیدر"},
+    {"name": "🛡 ادمین",    "emoji": "🛡", "points": 0,   "special": "انتصاب توسط مالک"},
+    {"name": "👑 مالک",     "emoji": "👑", "points": 0,   "special": "تنها یک نفر"},
+]
+MAX_PURCHASABLE_RANK = 4   # Diamond is highest buyable rank
 
 
-def _setup_logging() -> None:
-    root = logging.getLogger()
-    if root.handlers:
-        return   # already configured (guard against double-call on restart)
-    root.setLevel(logging.INFO)
+# ─────────────────────────── Database ───────────────────────────
+def get_db() -> sqlite3.Connection:
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
 
-    fmt = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATE)
 
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(fmt)
-    root.addHandler(ch)
+def init_db() -> None:
+    with get_db() as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            user_id    INTEGER PRIMARY KEY,
+            username   TEXT,
+            first_name TEXT,
+            rank_idx   INTEGER DEFAULT 0,
+            points     INTEGER DEFAULT 0,
+            is_admin   INTEGER DEFAULT 0,
+            joined_at  TEXT DEFAULT (datetime('now'))
+        );
+        """)
+    log.info("Database initialised at %s", DB_PATH)
 
-    fh = RotatingFileHandler(
-        LOG_FILE,
-        maxBytes=LOG_MAX_MB * 1024 * 1024,
-        backupCount=LOG_BACKUPS,
-        encoding="utf-8",
+
+# ── Settings helpers ──────────────────────────────────────────────
+def get_setting(key: str) -> Optional[str]:
+    with get_db() as con:
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def set_setting(key: str, value: str) -> None:
+    with get_db() as con:
+        con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, value))
+
+
+def get_owner_id() -> Optional[int]:
+    val = get_setting("owner_id")
+    return int(val) if val else None
+
+
+# ── User helpers ──────────────────────────────────────────────────
+def upsert_user(user) -> None:
+    with get_db() as con:
+        con.execute("""
+            INSERT INTO users(user_id, username, first_name)
+            VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username   = excluded.username,
+                first_name = excluded.first_name
+        """, (user.id, user.username or "", user.first_name or ""))
+
+
+def get_user(user_id: int) -> Optional[sqlite3.Row]:
+    with get_db() as con:
+        return con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+
+def add_points(user_id: int, amount: int) -> int:
+    with get_db() as con:
+        con.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amount, user_id))
+        row = con.execute("SELECT points FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row["points"]
+
+
+def set_rank(user_id: int, rank_idx: int) -> None:
+    with get_db() as con:
+        con.execute("UPDATE users SET rank_idx=? WHERE user_id=?", (rank_idx, user_id))
+
+
+def set_admin(user_id: int, state: bool) -> None:
+    with get_db() as con:
+        con.execute("UPDATE users SET is_admin=?, rank_idx=? WHERE user_id=?",
+                    (1 if state else 0, 6 if state else 0, user_id))
+
+
+def get_leaderboard(limit: int = 10) -> list[sqlite3.Row]:
+    with get_db() as con:
+        return con.execute(
+            "SELECT * FROM users ORDER BY rank_idx DESC, points DESC LIMIT ?", (limit,)
+        ).fetchall()
+
+
+def get_all_users() -> list[sqlite3.Row]:
+    with get_db() as con:
+        return con.execute("SELECT * FROM users ORDER BY joined_at DESC").fetchall()
+
+
+# ── Permission checks ─────────────────────────────────────────────
+def is_owner(user_id: int) -> bool:
+    return get_owner_id() == user_id
+
+
+def is_admin_or_owner(user_id: int) -> bool:
+    if is_owner(user_id):
+        return True
+    u = get_user(user_id)
+    return bool(u and u["is_admin"])
+
+
+# ─────────────────────────── Keyboards ──────────────────────────
+def main_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👤 پروفایل من",   callback_data="profile"),
+            InlineKeyboardButton("🏆 رتبه‌ها",       callback_data="ranks"),
+        ],
+        [
+            InlineKeyboardButton("📊 امتیاز من",    callback_data="mypoints"),
+            InlineKeyboardButton("🏅 تابلو برترین‌ها", callback_data="leaderboard"),
+        ],
+        [
+            InlineKeyboardButton("⬆️ ارتقا رتبه",   callback_data="upgrade"),
+            InlineKeyboardButton("ℹ️ راهنما",        callback_data="help"),
+        ],
+    ])
+
+
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👥 لیست اعضا",       callback_data="adm_members"),
+            InlineKeyboardButton("🎁 دادن امتیاز",      callback_data="adm_givepoints"),
+        ],
+        [
+            InlineKeyboardButton("🛡 انتصاب ادمین",     callback_data="adm_setadmin"),
+            InlineKeyboardButton("⭐ تایید VIP",        callback_data="adm_setvip"),
+        ],
+        [
+            InlineKeyboardButton("📢 اطلاع‌رسانی",      callback_data="adm_broadcast"),
+            InlineKeyboardButton("📈 آمار ربات",        callback_data="adm_stats"),
+        ],
+        [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
+    ])
+
+
+def back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="back_main")]])
+
+
+# ─────────────────────────── Helpers ────────────────────────────
+def rank_info(idx: int) -> dict:
+    return RANKS[idx] if 0 <= idx < len(RANKS) else RANKS[0]
+
+
+def profile_text(u: sqlite3.Row) -> str:
+    r = rank_info(u["rank_idx"])
+    owner_id = get_owner_id()
+    badge = ""
+    if owner_id and u["user_id"] == owner_id:
+        badge = "  👑 مالک"
+    elif u["is_admin"]:
+        badge = "  🛡 ادمین"
+    return (
+        f"╔══ 👤 پروفایل شما ══╗\n"
+        f"┃ نام: <b>{u['first_name']}</b>{badge}\n"
+        f"┃ یوزرنیم: @{u['username'] or '—'}\n"
+        f"┃ رتبه: {r['name']}\n"
+        f"┃ امتیاز: <b>{u['points']:,}</b>\n"
+        f"┃ عضو از: {u['joined_at'][:10]}\n"
+        f"╚══════════════════╝"
     )
-    fh.setFormatter(fmt)
-    root.addHandler(fh)
-
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("telegram").setLevel(logging.WARNING)
-    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 
-_setup_logging()
-logger = logging.getLogger("bot")
+# ─────────────────────────── Handlers ───────────────────────────
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
-BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "").strip()
-
-if not BOT_TOKEN:
-    logger.critical(
-        "BOT_TOKEN is not set!\n"
-        "  → Replit: Tools → Secrets → add key BOT_TOKEN with your token value.\n"
-        "  → Local:  export BOT_TOKEN='your-token-here'"
-    )
-    sys.exit(1)
-
-# Retry / resilience settings
-_BASE_RETRY_DELAY      = 5      # seconds
-_MAX_RETRY_DELAY       = 120    # seconds (exponential back-off ceiling)
-_CONFLICT_WAIT         = 35     # seconds to wait after a 409 Conflict
-_MAX_CONSECUTIVE_FAILS = 20     # give up after this many back-to-back crashes
-
-# Signals main loop to exit cleanly when InvalidToken is detected inside async context
-_invalid_token_flag = threading.Event()
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. BOT HANDLERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:          # [FIX #4] guard
-        return
+# /start
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
-    name = user.first_name if user else "there"
-    logger.info("/start from user_id=%s", user.id if user else "?")
-    await update.message.reply_html(
-        f"👋 سلام <b>{name}</b>!\n\n"
-        "من یک ربات خودترمیم هستم — همیشه آنلاینم 💪\n\n"
-        "/help — راهنما\n"
-        "/status — وضعیت ربات"
-    )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:          # [FIX #4]
-        return
+    upsert_user(user)
+    log.info("/start from user_id=%s (%s)", user.id, user.first_name)
     await update.message.reply_text(
-        "دستورات موجود:\n"
-        "/start   — شروع\n"
-        "/help    — راهنما\n"
-        "/status  — وضعیت سرور و ربات\n"
+        f"سلام <b>{user.first_name}</b>! 👋\n"
+        "به <b>Matrix Family Bot</b> خوش اومدی 🌟\n"
+        "از منوی زیر انتخاب کن:",
+        reply_markup=main_menu_kb(),
+        parse_mode=ParseMode.HTML,
     )
 
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message:          # [FIX #4]
+# /setowner  — one-time bootstrap, secure against hijack
+async def cmd_setowner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    upsert_user(user)
+    existing = get_owner_id()
+
+    # Rule 1: env override takes precedence
+    env_owner = int(os.environ.get("OWNER_ID", "0"))
+    if env_owner and env_owner != user.id:
+        return  # silently ignore
+
+    # Rule 2: DB owner exists and it's not us → silently ignore
+    if existing and existing != user.id:
         return
-    s = keep_alive.get_state()
-    now    = datetime.now(timezone.utc)
-    uptime = (now - s["start_time"]).total_seconds()
+
+    # Rule 3: already owner
+    if existing == user.id:
+        await update.message.reply_text("✅ شما قبلاً مالک این ربات هستید.")
+        return
+
+    # First-time claim
+    set_setting("owner_id", str(user.id))
+    set_rank(user.id, 7)  # Owner rank
+    log.info("Owner set: user_id=%s (%s)", user.id, user.first_name)
+    await update.message.reply_text(
+        "👑 تبریک! شما مالک این ربات شدید.\n"
+        "از /admin برای پنل مدیریت استفاده کن.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# /admin
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    upsert_user(user)
+    if not is_admin_or_owner(user.id):
+        await update.message.reply_text("⛔ دسترسی ندارید.")
+        return
+    badge = "👑 مالک" if is_owner(user.id) else "🛡 ادمین"
+    await update.message.reply_text(
+        f"🔐 پنل مدیریت — <b>{badge}</b>\nیک گزینه انتخاب کنید:",
+        reply_markup=admin_menu_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# /myinfo
+async def cmd_myinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    upsert_user(user)
+    u = get_user(user.id)
+    await update.message.reply_text(
+        profile_text(u),
+        reply_markup=back_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# /ranks
+async def cmd_ranks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    lines = ["🏆 <b>جدول رتبه‌ها</b>\n"]
+    for i, r in enumerate(RANKS):
+        if r["special"]:
+            lines.append(f"{i}. {r['name']} — <i>ویژه: {r['special']}</i>")
+        elif r["points"] == 0:
+            lines.append(f"{i}. {r['name']} — رایگان")
+        else:
+            lines.append(f"{i}. {r['name']} — هزینه: <b>{r['points']:,}</b> امتیاز")
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=back_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# /leaderboard
+async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    rows = get_leaderboard(10)
+    if not rows:
+        await update.message.reply_text("هنوز اعضایی ثبت نشده‌اند.")
+        return
+    lines = ["🏅 <b>برترین اعضا</b>\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, u in enumerate(rows):
+        m = medals[i] if i < 3 else f"{i+1}."
+        r = rank_info(u["rank_idx"])
+        lines.append(f"{m} {u['first_name']} — {r['emoji']} {u['points']:,} امتیاز")
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=back_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# /status
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    uptime = time.time() - _start_time
     h, rem = divmod(int(uptime), 3600)
-    m, sec = divmod(rem, 60)
-    last_hb = s["last_heartbeat"]
-    hb_ago  = (
-        f"{round((now - last_hb).total_seconds())} ثانیه پیش"
-        if last_hb else "هنوز ثبت نشده"
-    )
+    m, s = divmod(rem, 60)
+    owner_id = get_owner_id()
+    member_count = len(get_all_users())
     await update.message.reply_text(
-        f"✅ ربات فعال است\n"
-        f"⏱ آپتایم: {h:02d}:{m:02d}:{sec:02d}\n"
-        f"💓 آخرین heartbeat: {hb_ago}\n"
-        f"🔄 وضعیت polling: {'فعال' if s['bot_running'] else 'غیرفعال'}\n"
-        f"🔁 تعداد ری‌استارت‌ها: {s['restart_count']}"
+        f"🟢 <b>ربات آنلاین است</b>\n"
+        f"⏱ آپتایم: <b>{h:02d}:{m:02d}:{s:02d}</b>\n"
+        f"👥 اعضا: <b>{member_count}</b>\n"
+        f"👑 مالک ثبت‌شده: {'✅' if owner_id else '❌ هنوز /setowner نزدید'}\n"
+        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        parse_mode=ParseMode.HTML,
     )
 
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Echo handler — replace or extend with your own logic."""
-    if not update.message or not update.effective_user:   # [FIX #4]
+# /help
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "📖 <b>راهنمای دستورات</b>\n\n"
+        "<b>عمومی:</b>\n"
+        "/start — منوی اصلی\n"
+        "/myinfo — پروفایل من\n"
+        "/ranks — جدول رتبه‌ها\n"
+        "/leaderboard — برترین اعضا\n"
+        "/status — وضعیت ربات\n\n"
+        "<b>ادمین/مالک:</b>\n"
+        "/admin — پنل مدیریت\n"
+        "/givepoints [user_id] [amount] — دادن امتیاز\n"
+        "/setadmin [user_id] — انتصاب ادمین\n"
+        "/removeadmin [user_id] — حذف ادمین\n"
+        "/setvip [user_id] — تایید VIP\n"
+        "/broadcast [پیام] — اطلاع‌رسانی\n\n"
+        "<b>اولین راه‌اندازی:</b>\n"
+        "/setowner — یک‌بار اجرا کنید تا مالک شوید",
+        reply_markup=back_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# /givepoints [user_id] [amount]
+async def cmd_givepoints(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin_or_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی ندارید.")
         return
-    text = update.message.text or ""
-    logger.debug("Message from user_id=%s: %.80s", update.effective_user.id, text)
-    await update.message.reply_text(f"دریافت شد: {text}")
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text("استفاده: /givepoints [user_id] [مقدار]")
+        return
+    try:
+        uid, amount = int(args[0]), int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ مقادیر نامعتبر.")
+        return
+    new_bal = add_points(uid, amount)
+    await update.message.reply_text(
+        f"✅ {amount:,} امتیاز به کاربر {uid} داده شد.\n"
+        f"موجودی جدید: <b>{new_bal:,}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    try:
+        await ctx.bot.send_message(uid, f"🎁 <b>{amount:,} امتیاز</b> دریافت کردید!\nموجودی: {new_bal:,}", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Global error handler — classifies and responds to every Telegram error."""
-    err = context.error
+# /setadmin [user_id]
+async def cmd_setadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ فقط مالک می‌تواند ادمین منصوب کند.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("استفاده: /setadmin [user_id]")
+        return
+    uid = int(ctx.args[0])
+    set_admin(uid, True)
+    await update.message.reply_text(f"✅ کاربر {uid} به عنوان ادمین منصوب شد.")
+    try:
+        await ctx.bot.send_message(uid, "🛡 شما به عنوان <b>ادمین</b> منصوب شدید!", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
-    # [FIX #2] Conflict — two instances running; back off and let outer loop restart
-    if isinstance(err, Conflict):
-        logger.error(
-            "Conflict (409): another bot instance is already polling. "
-            "Waiting %s s before restart.", _CONFLICT_WAIT,
+
+# /removeadmin [user_id]
+async def cmd_removeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ فقط مالک می‌تواند ادمین را حذف کند.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("استفاده: /removeadmin [user_id]")
+        return
+    uid = int(ctx.args[0])
+    set_admin(uid, False)
+    await update.message.reply_text(f"✅ دسترسی ادمین کاربر {uid} حذف شد.")
+
+
+# /setvip [user_id]
+async def cmd_setvip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin_or_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی ندارید.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("استفاده: /setvip [user_id]")
+        return
+    uid = int(ctx.args[0])
+    u = get_user(uid)
+    if not u:
+        await update.message.reply_text("❌ کاربر پیدا نشد.")
+        return
+    if u["rank_idx"] >= 5:
+        await update.message.reply_text("کاربر قبلاً VIP یا بالاتر است.")
+        return
+    set_rank(uid, 5)
+    await update.message.reply_text(f"✅ کاربر {uid} به ⭐ VIP ارتقا یافت.")
+    try:
+        await ctx.bot.send_message(uid, "⭐ تبریک! شما به رتبه <b>VIP</b> ارتقا یافتید!", parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+
+
+# /broadcast [message]
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin_or_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی ندارید.")
+        return
+    if not ctx.args:
+        await update.message.reply_text("استفاده: /broadcast [متن پیام]")
+        return
+    text = " ".join(ctx.args)
+    users = get_all_users()
+    sent, failed = 0, 0
+    for u in users:
+        try:
+            await ctx.bot.send_message(u["user_id"], f"📢 <b>اطلاعیه:</b>\n\n{text}", parse_mode=ParseMode.HTML)
+            sent += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(f"✅ پیام ارسال شد.\n✉️ موفق: {sent}\n❌ ناموفق: {failed}")
+
+
+# ─────────────────────────── Upgrade flow ───────────────────────
+async def show_upgrade(update: Update, u: sqlite3.Row, edit: bool = False) -> None:
+    cur_idx = u["rank_idx"]
+    r_cur = rank_info(cur_idx)
+    msg_obj = update.callback_query.message if edit else update.message
+
+    if cur_idx >= MAX_PURCHASABLE_RANK:
+        text = (
+            f"رتبه فعلی شما: {r_cur['name']}\n\n"
+            "شما به بالاترین رتبه قابل خرید رسیده‌اید! 🎉\n"
+            "رتبه‌های بالاتر (VIP، ادمین) نیاز به تایید دارند."
         )
-        keep_alive.request_restart(reason="Conflict 409")
-        await asyncio.sleep(_CONFLICT_WAIT)
-        return
-
-    # [FIX #3] Bad token — signal main loop via flag instead of sys.exit() in async context
-    if isinstance(err, InvalidToken):
-        logger.critical(
-            "InvalidToken: BOT_TOKEN is wrong. Fix it in Secrets then restart."
-        )
-        _invalid_token_flag.set()   # triggers clean exit in _run_bot_once()
-        return
-
-    if isinstance(err, RetryAfter):
-        logger.warning("Rate-limited — sleeping %.0f s.", err.retry_after)
-        await asyncio.sleep(err.retry_after)
-
-    elif isinstance(err, TimedOut):
-        logger.warning("Request timed out — PTB will retry automatically.")
-
-    elif isinstance(err, NetworkError):
-        logger.warning("Network error: %s — PTB will retry.", err)
-
-    elif isinstance(err, Forbidden):
-        logger.info("Bot blocked by user (Forbidden).")
-
-    elif isinstance(err, BadRequest):
-        logger.warning("Bad API request: %s", err)
-
-    elif isinstance(err, TelegramError):
-        logger.error("TelegramError: %s", err, exc_info=True)
-
+        kb = back_kb()
     else:
-        logger.error("Non-Telegram error in handler: %s", err, exc_info=True)
+        next_idx = cur_idx + 1
+        r_next = rank_info(next_idx)
+        cost = r_next["points"]
+        balance = u["points"]
+        can_buy = balance >= cost
+        text = (
+            f"رتبه فعلی: {r_cur['name']}\n"
+            f"رتبه بعدی: {r_next['name']}\n"
+            f"هزینه ارتقا: <b>{cost:,}</b> امتیاز\n"
+            f"موجودی شما: <b>{balance:,}</b> امتیاز\n\n"
+            f"{'✅ می‌توانید ارتقا دهید!' if can_buy else '❌ امتیاز کافی ندارید.'}"
+        )
+        buttons = []
+        if can_buy:
+            buttons.append(InlineKeyboardButton(f"⬆️ ارتقا به {r_next['name']}", callback_data=f"buy_rank_{next_idx}"))
+        buttons_row = [buttons] if buttons else []
+        buttons_row.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
+        kb = InlineKeyboardMarkup(buttons_row)
+
+    if edit:
+        await msg_obj.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+    else:
+        await msg_obj.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. APPLICATION FACTORY
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────── Callback queries ────────────────────
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    upsert_user(user)
+    u = get_user(user.id)
+    data = q.data
 
-def _build_application() -> Application:
+    # ── Main menu items ──────────────────────────────────────────
+    if data == "back_main":
+        await q.message.edit_text(
+            f"سلام <b>{user.first_name}</b>! از منوی زیر انتخاب کن:",
+            reply_markup=main_menu_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "profile":
+        await q.message.edit_text(profile_text(u), reply_markup=back_kb(), parse_mode=ParseMode.HTML)
+
+    elif data == "mypoints":
+        r = rank_info(u["rank_idx"])
+        await q.message.edit_text(
+            f"📊 <b>امتیاز شما</b>\n\n"
+            f"💰 موجودی: <b>{u['points']:,}</b> امتیاز\n"
+            f"🏆 رتبه: {r['name']}\n\n"
+            "برای ارتقا روی ⬆️ ارتقا رتبه بزنید.",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "ranks":
+        lines = ["🏆 <b>جدول رتبه‌ها</b>\n"]
+        for i, r in enumerate(RANKS):
+            if r["special"]:
+                lines.append(f"{i+1}. {r['name']} — <i>{r['special']}</i>")
+            elif r["points"] == 0:
+                lines.append(f"{i+1}. {r['name']} — رایگان")
+            else:
+                lines.append(f"{i+1}. {r['name']} — هزینه: <b>{r['points']:,}</b> امتیاز")
+        await q.message.edit_text("\n".join(lines), reply_markup=back_kb(), parse_mode=ParseMode.HTML)
+
+    elif data == "leaderboard":
+        rows = get_leaderboard(10)
+        lines = ["🏅 <b>برترین اعضا</b>\n"]
+        medals = ["🥇", "🥈", "🥉"]
+        for i, row in enumerate(rows):
+            m = medals[i] if i < 3 else f"{i+1}."
+            r = rank_info(row["rank_idx"])
+            lines.append(f"{m} {row['first_name']} — {r['emoji']} {row['points']:,}")
+        await q.message.edit_text("\n".join(lines), reply_markup=back_kb(), parse_mode=ParseMode.HTML)
+
+    elif data == "upgrade":
+        await show_upgrade(update, u, edit=True)
+
+    elif data.startswith("buy_rank_"):
+        next_idx = int(data.split("_")[-1])
+        r_next = rank_info(next_idx)
+        cost = r_next["points"]
+        if u["points"] < cost:
+            await q.message.edit_text("❌ امتیاز کافی ندارید.", reply_markup=back_kb())
+            return
+        # deduct points and upgrade
+        with get_db() as con:
+            con.execute("UPDATE users SET points = points - ?, rank_idx = ? WHERE user_id = ?",
+                        (cost, next_idx, user.id))
+        log.info("Rank upgrade: user_id=%s → rank %s (cost %s pts)", user.id, next_idx, cost)
+        await q.message.edit_text(
+            f"🎉 تبریک! به رتبه {r_next['name']} ارتقا یافتید!\n"
+            f"هزینه: {cost:,} امتیاز کسر شد.",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    elif data == "help":
+        await q.message.edit_text(
+            "📖 <b>راهنما</b>\n\n"
+            "• /start — منوی اصلی\n"
+            "• /myinfo — پروفایل\n"
+            "• /ranks — رتبه‌ها\n"
+            "• /leaderboard — برترین‌ها\n"
+            "• /status — وضعیت\n"
+            "• /admin — پنل ادمین\n\n"
+            "برای ارتقا رتبه امتیاز جمع کنید! 🏆",
+            reply_markup=back_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+
+    # ── Admin panel items ─────────────────────────────────────────
+    elif data == "adm_members":
+        if not is_admin_or_owner(user.id):
+            await q.answer("⛔ دسترسی ندارید.", show_alert=True)
+            return
+        rows = get_all_users()
+        lines = [f"👥 <b>اعضا ({len(rows)} نفر)</b>\n"]
+        for row in rows[:20]:
+            r = rank_info(row["rank_idx"])
+            lines.append(f"• {row['first_name']} — {r['emoji']} {row['points']:,} — ID:{row['user_id']}")
+        if len(rows) > 20:
+            lines.append(f"\n... و {len(rows)-20} نفر دیگر")
+        await q.message.edit_text("\n".join(lines), reply_markup=admin_menu_kb(), parse_mode=ParseMode.HTML)
+
+    elif data == "adm_stats":
+        if not is_admin_or_owner(user.id):
+            await q.answer("⛔ دسترسی ندارید.", show_alert=True)
+            return
+        rows = get_all_users()
+        rank_counts = {}
+        for row in rows:
+            rn = RANKS[row["rank_idx"]]["name"]
+            rank_counts[rn] = rank_counts.get(rn, 0) + 1
+        lines = [f"📈 <b>آمار ربات</b>\n\nکل اعضا: <b>{len(rows)}</b>\n\nتوزیع رتبه:"]
+        for rn, cnt in sorted(rank_counts.items(), key=lambda x: -x[1]):
+            lines.append(f"  {rn}: {cnt} نفر")
+        await q.message.edit_text("\n".join(lines), reply_markup=admin_menu_kb(), parse_mode=ParseMode.HTML)
+
+    elif data in ("adm_givepoints", "adm_setadmin", "adm_setvip", "adm_broadcast"):
+        if not is_admin_or_owner(user.id):
+            await q.answer("⛔ دسترسی ندارید.", show_alert=True)
+            return
+        hints = {
+            "adm_givepoints": "برای دادن امتیاز:\n/givepoints [user_id] [مقدار]",
+            "adm_setadmin":   "برای انتصاب ادمین:\n/setadmin [user_id]",
+            "adm_setvip":     "برای تایید VIP:\n/setvip [user_id]",
+            "adm_broadcast":  "برای اطلاع‌رسانی:\n/broadcast [متن]",
+        }
+        await q.message.edit_text(hints[data], reply_markup=admin_menu_kb())
+
+
+# ── Echo unrecognised messages ────────────────────────────────────
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    upsert_user(user)
+    await update.message.reply_text(
+        "برای استفاده از ربات /start بزنید. 🤖",
+        reply_markup=main_menu_kb(),
+    )
+
+
+# ─────────────────────────── Bot commands list ───────────────────
+COMMANDS = [
+    BotCommand("start",       "منوی اصلی"),
+    BotCommand("myinfo",      "پروفایل من"),
+    BotCommand("ranks",       "جدول رتبه‌ها"),
+    BotCommand("leaderboard", "برترین اعضا"),
+    BotCommand("status",      "وضعیت ربات"),
+    BotCommand("help",        "راهنما"),
+    BotCommand("admin",       "پنل مدیریت"),
+    BotCommand("setowner",    "انتصاب مالک (یک‌بار)"),
+    BotCommand("givepoints",  "دادن امتیاز [user_id] [مقدار]"),
+    BotCommand("setadmin",    "انتصاب ادمین [user_id]"),
+    BotCommand("removeadmin", "حذف ادمین [user_id]"),
+    BotCommand("setvip",      "تایید VIP [user_id]"),
+    BotCommand("broadcast",   "اطلاع‌رسانی به همه"),
+]
+
+
+# ─────────────────────────── Bot runner ─────────────────────────
+_start_time = time.time()
+
+
+async def _post_init(app: Application) -> None:
+    """Called once after Application.initialize() — safe place for async setup."""
+    await app.bot.set_my_commands(COMMANDS)
+    log.info("Bot commands registered in Telegram menu.")
+
+
+def run_bot() -> None:
+    """Build and run the bot. PTB v21 run_polling() manages its own event loop."""
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .connect_timeout(20)
-        .read_timeout(30)          # long-poll window
-        .write_timeout(20)
-        .pool_timeout(20)
+        .post_init(_post_init)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(30)
+        .pool_timeout(30)
         .build()
     )
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_error_handler(error_handler)
-    return app
+
+    # Register handlers
+    app.add_handler(CommandHandler("start",        cmd_start))
+    app.add_handler(CommandHandler("setowner",     cmd_setowner))
+    app.add_handler(CommandHandler("admin",        cmd_admin))
+    app.add_handler(CommandHandler("myinfo",       cmd_myinfo))
+    app.add_handler(CommandHandler("ranks",        cmd_ranks))
+    app.add_handler(CommandHandler("leaderboard",  cmd_leaderboard))
+    app.add_handler(CommandHandler("status",       cmd_status))
+    app.add_handler(CommandHandler("help",         cmd_help))
+    app.add_handler(CommandHandler("givepoints",   cmd_givepoints))
+    app.add_handler(CommandHandler("setadmin",     cmd_setadmin))
+    app.add_handler(CommandHandler("removeadmin",  cmd_removeadmin))
+    app.add_handler(CommandHandler("setvip",       cmd_setvip))
+    app.add_handler(CommandHandler("broadcast",    cmd_broadcast))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    log.info("Bot is now polling. Ctrl+C to stop.")
+    # run_polling() is synchronous in PTB v21 — it creates and manages its own event loop
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 5. HEARTBEAT TASK  [FIX #6]
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────── Self-healing entry point ────────────
+def main() -> None:
+    if not BOT_TOKEN:
+        log.critical("BOT_TOKEN is not set! Add it to Replit Secrets.")
+        sys.exit(1)
 
-async def _heartbeat_task() -> None:
-    """Ticks every 20 s; wrapped in try/except so it never dies silently."""
-    logger.debug("Heartbeat task started.")
-    while True:
-        try:
-            keep_alive.heartbeat()
-        except Exception as exc:             # [FIX #6] never let this task die
-            logger.error("Heartbeat error: %s", exc)
-        await asyncio.sleep(20)
+    init_db()
+    start_keep_alive()
 
+    banner = "Matrix-Family Bot — v3.0 starting"
+    log.info("═" * len(banner))
+    log.info(" %s ", banner)
+    log.info("═" * len(banner))
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 6. GRACEFUL SHUTDOWN HELPER
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _stop_application(application: Application) -> None:
-    """Stop updater → stop application, swallowing errors so shutdown always runs."""
-    try:
-        if application.updater and application.updater.running:
-            await application.updater.stop()
-    except Exception as exc:
-        logger.warning("Error stopping updater: %s", exc)
-
-    try:
-        if application.running:
-            await application.stop()
-    except Exception as exc:
-        logger.warning("Error stopping application: %s", exc)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 7. SINGLE BOT RUN (one attempt)
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _run_bot_once() -> None:
-    """
-    One full bot lifecycle: initialize → start → poll → (watchdog/error) → stop.
-    Raises on unrecoverable errors so the outer loop can decide whether to retry.
-    """
-    logger.info("Building Telegram Application …")
-    application = _build_application()
-
-    hb_task: asyncio.Task | None = None
-    keep_alive.set_bot_running(True)
-
-    try:
-        await application.initialize()
-        await application.start()
-
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            # poll_interval is NOT passed here — [FIX #8]
-            # PTB v21 uses the timeouts set on the builder.
-        )
-
-        logger.info("Bot is now polling. Ctrl+C to stop.")
-
-        # Start heartbeat after polling is confirmed running
-        hb_task = asyncio.get_running_loop().create_task(
-            _heartbeat_task(), name="heartbeat",
-        )
-
-        # Main wait loop — wakes every second to check watchdog flag and polling health
-        while True:
-            await asyncio.sleep(1)
-
-            # [review fix #2] InvalidToken detected asynchronously → exit immediately
-            if _invalid_token_flag.is_set():
-                logger.critical("InvalidToken flag set — exiting.")
-                sys.exit(1)
-
-            # [review fix #1] Verify polling is actually running, not just heartbeat
-            if not application.updater.running:
-                logger.error(
-                    "Updater polling has stopped unexpectedly — triggering restart."
-                )
-                keep_alive.request_restart(reason="updater.running=False")
-
-            if keep_alive.clear_restart_flag():
-                logger.warning("Restart flag set — stopping current run.")
-                break
-
-    finally:
-        # Cancel heartbeat first
-        if hb_task and not hb_task.done():
-            hb_task.cancel()
-            try:
-                await hb_task
-            except asyncio.CancelledError:
-                pass
-
-        await _stop_application(application)   # [FIX #9] single controlled stop
-
-        try:
-            await application.shutdown()
-        except Exception as exc:
-            logger.warning("Error during shutdown: %s", exc)
-
-        keep_alive.set_bot_running(False)
-        logger.info("Bot run finished cleanly.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 8. OUTER SELF-HEALING LOOP  [FIX #1, #5, #7]
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _run_forever() -> None:
-    """
-    Outer loop: manages event loops, catches every exception, retries with
-    exponential back-off, and gives up after MAX_CONSECUTIVE_FAILS failures.
-    """
-    retry_delay        = _BASE_RETRY_DELAY
-    attempt            = 0
-    consecutive_fails  = 0
+    consecutive_fails = 0
+    MAX_FAILS = 10
+    invalid_token_flag = False
 
     while True:
-        attempt += 1
-        logger.info("━━━ Bot start attempt #%d (consecutive_fails=%d) ━━━",
-                    attempt, consecutive_fails)
+        if invalid_token_flag:
+            log.critical("Invalid token — stopping. Check BOT_TOKEN secret.")
+            sys.exit(1)
 
-        # [FIX #1] Explicit event loop per attempt — avoids "loop is closed" errors
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
+        log.info("━━━ Bot start attempt #%d (fails=%d) ━━━",
+                 consecutive_fails + 1, consecutive_fails)
         try:
-            loop.run_until_complete(_run_bot_once())
-            # Normal exit (watchdog restart or graceful stop)
+            run_bot()   # PTB v21 run_polling() manages its own event loop
             consecutive_fails = 0
-            retry_delay = _BASE_RETRY_DELAY
-            logger.info("Bot run ended normally — restarting in %d s.", retry_delay)
-            time.sleep(retry_delay)
 
-        except KeyboardInterrupt:           # [FIX #5] let Ctrl+C exit cleanly
-            logger.info("KeyboardInterrupt — exiting.")
-            sys.exit(0)
+        except InvalidToken:
+            log.critical("InvalidToken — aborting.")
+            invalid_token_flag = True
 
-        except SystemExit:                  # [FIX #5] let sys.exit() propagate
-            raise
-
-        except InvalidToken:               # [FIX #3] wrong token → exit immediately
-            logger.critical(
-                "InvalidToken: check BOT_TOKEN in Replit Secrets. Exiting."
-            )
-            sys.exit(1)
-
-        except Conflict:                   # [FIX #2] 409 — wait longer, then retry
+        except Conflict:
+            log.error("Conflict 409 — another instance is running. Waiting 10s …")
             consecutive_fails += 1
-            logger.error(
-                "Conflict (409) — another instance may be running. "
-                "Waiting %d s before retry.", _CONFLICT_WAIT,
-            )
-            time.sleep(_CONFLICT_WAIT)
+            time.sleep(10)
 
-        except (NetworkError, TimedOut) as exc:
+        except NetworkError as e:
             consecutive_fails += 1
-            logger.warning("Network issue: %s — retry in %d s.", exc, retry_delay)
-            time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, _MAX_RETRY_DELAY)
+            wait = min(5 * consecutive_fails, 60)
+            log.warning("NetworkError: %s — retry in %ds (fail #%d)", e, wait, consecutive_fails)
+            time.sleep(wait)
 
-        except TelegramError as exc:
+        except KeyboardInterrupt:
+            log.info("Shutdown requested. Goodbye!")
+            break
+
+        except Exception as e:
             consecutive_fails += 1
-            logger.error("TelegramError: %s — retry in %d s.", exc, retry_delay)
-            time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, _MAX_RETRY_DELAY)
-
-        except Exception as exc:
-            consecutive_fails += 1
-            logger.exception("Unexpected crash (attempt %d): %s", attempt, exc)
-            logger.info("Restarting in %d s …", retry_delay)
-            time.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, _MAX_RETRY_DELAY)
-
-        finally:
-            # Always close the loop so resources are freed  [FIX #1]
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-                loop.run_until_complete(loop.shutdown_default_executor())
-            except Exception:
-                pass
-            loop.close()
-
-        # [FIX #7] Safety valve — exit if bot is in a crash-loop
-        if consecutive_fails >= _MAX_CONSECUTIVE_FAILS:
-            logger.critical(
-                "Reached %d consecutive failures — stopping to prevent CPU spin. "
-                "Fix the underlying error, then restart the Repl.",
-                _MAX_CONSECUTIVE_FAILS,
-            )
-            sys.exit(1)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9. ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _handle_sigterm(_sig, _frame) -> None:
-    logger.info("SIGTERM received — shutting down gracefully.")
-    sys.exit(0)
+            wait = min(5 * consecutive_fails, 120)
+            log.exception("Unhandled exception (fail #%d) — retry in %ds: %s",
+                          consecutive_fails, wait, e)
+            if consecutive_fails >= MAX_FAILS:
+                log.critical("Too many consecutive failures (%d). Exiting.", consecutive_fails)
+                sys.exit(1)
+            time.sleep(wait)
 
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGTERM, _handle_sigterm)
-
-    logger.info("════════════════════════════════════════════")
-    logger.info(" Self-Healing Telegram Bot — v2.0 starting ")
-    logger.info("════════════════════════════════════════════")
-
-    # Start Flask keep-alive + watchdog threads (background, non-blocking)
-    keep_alive.start()
-
-    # Block forever with self-healing
-    _run_forever()
+    main()
