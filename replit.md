@@ -1,45 +1,60 @@
-# [Project name]
+# Matrix-Family Telegram Bot — v4.0
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+## Project Overview
 
-## Run & Operate
-
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+A production-ready Telegram bot for the Matrix-Family community with:
+- **Reply keyboard navigation** (bottom keyboard, no commands except /start)
+- **17-rank military ladder** from Members → Staff Leader
+- **Points economy**: earn by activities, spend on rank upgrades
+- **Point request flow**: users submit proof → admins approve/reject → points/ranks applied
+- **Betting system**: P2P wagering by username
+- **Leaderboard**: sorted by points, auto-rewards Top 3 every 22 days
+- **Admin panel**: add/remove admins, broadcast, set rank/points, ban/remove users, backup/restore
+- **SQLite persistence** with automatic backup support
+- **Self-healing polling loop**: retries on network errors, conflicts, and unknown exceptions
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.11
+- python-telegram-bot v21.6 (async, PTB)
+- Flask 3.0.3 (keep-alive / health endpoint)
+- SQLite (family.db)
 
-## Where things live
+## Running
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+Set the `BOT_TOKEN` secret (from @BotFather), then the "Telegram Bot" workflow starts automatically.
 
-## Architecture decisions
+```
+python3 main.py
+```
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+## Key Files
 
-## Product
+| File | Purpose |
+|------|---------|
+| `main.py` | All bot logic: handlers, DB, state machine, self-healing loop |
+| `keep_alive.py` | Flask server for UptimeRobot pings + watchdog heartbeat |
+| `family.db` | SQLite database (auto-created on first run) |
+| `backups/` | DB backup files (created via admin panel) |
+| `bot.log` | Rotating log file |
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+## First-time Setup
 
-## User preferences
+1. Add `BOT_TOKEN` to Replit Secrets
+2. Click Run (or restart the "Telegram Bot" workflow)
+3. Send `/start` to the bot in Telegram
+4. The first user to send `/start` automatically becomes the Owner (👑)
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+## Rank System
 
-## Gotchas
+Members → Bronze (50P) → Silver (70P) → Gold (100P) → Diamond (120P) → Sentry (150P) →
+Soldier (170P) → Grenadier (200P) → Sergeant (240P) → Colonel (300P) → Lieutenant (350P) →
+Ranger (400P) → Fusilier (450P) → Gunner (550P) → Marine (650P) → Major (750P) →
+Brigadier (900P) → Staff Leader (manual, Owner decides)
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+## User Preferences
 
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- Persian-first UI, military rank names in English
+- Reply keyboard buttons (no inline keyboard for main navigation)
+- Every menu has ⬅️ بازگشت and 🏠 منوی اصلی
+- Owner panel visible to admins too; destructive actions (ban, remove, reset) restricted to Owner

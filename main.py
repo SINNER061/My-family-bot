@@ -1,24 +1,32 @@
 """
-Matrix-Family Telegram Bot — v3.0
-Self-healing · Owner security · Rank system · Points · Admin panel · SQLite
+Matrix-Family Telegram Bot — v4.0
+Persian-first · Reply Keyboards · Rank System · Points · Betting · Admin Panel · SQLite
 """
 
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import os
+import random
+import shutil
 import sqlite3
 import sys
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
 from telegram import (
     BotCommand,
+    Document,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
@@ -27,6 +35,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
@@ -35,13 +44,12 @@ from telegram.error import Conflict, InvalidToken, NetworkError, TelegramError
 from keep_alive import start_keep_alive
 
 # ─────────────────────────── Logging ────────────────────────────
-LOG_FILE = "bot.log"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.FileHandler("bot.log", encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -50,20 +58,96 @@ log = logging.getLogger("bot")
 # ─────────────────────────── Config ─────────────────────────────
 BOT_TOKEN: str = os.environ.get("BOT_TOKEN", "")
 DB_PATH = Path("family.db")
+BACKUP_DIR = Path("backups")
+BACKUP_DIR.mkdir(exist_ok=True)
+_start_time = time.time()
 
-# Rank ladder — points = incremental COST from previous rank (not cumulative)
-RANKS: list[dict] = [
-    {"name": "👤 عضو",      "emoji": "👤", "points": 0,   "special": None},
-    {"name": "🥉 برنز",     "emoji": "🥉", "points": 70,  "special": None},
-    {"name": "🥈 نقره",     "emoji": "🥈", "points": 150, "special": None},
-    {"name": "🥇 طلا",      "emoji": "🥇", "points": 300, "special": None},
-    {"name": "💎 الماس",    "emoji": "💎", "points": 500, "special": None},
-    {"name": "⭐ VIP",      "emoji": "⭐", "points": 0,   "special": "تایید توسط لیدر"},
-    {"name": "🛡 ادمین",    "emoji": "🛡", "points": 0,   "special": "انتصاب توسط مالک"},
-    {"name": "👑 مالک",     "emoji": "👑", "points": 0,   "special": "تنها یک نفر"},
+# ─────────────────────────── Ranks ──────────────────────────────
+RANKS = [
+    "Members", "Bronze", "Silver", "Gold", "Diamond",
+    "Sentry", "Soldier", "Grenadier", "Sergeant", "Colonel",
+    "Lieutenant", "Ranger", "Fusilier", "Gunner", "Marine",
+    "Major", "Brigadier", "Staff Leader",
 ]
-MAX_PURCHASABLE_RANK = 4   # Diamond is highest buyable rank
+# Cost in points to advance TO this rank from the previous one
+RANK_COSTS = [0, 50, 70, 100, 120, 150, 170, 200, 240, 300, 350, 400, 450, 550, 650, 750, 900, 0]
+MAX_AUTO_RANK = 16   # Brigadier is highest auto-purchasable rank (Staff Leader is manual)
+RANK_TABLE = (
+    "📜 <b>رنک‌های Matrix-Family</b>\n\n"
+    "⚔ Members → Bronze        <b>50P</b>\n"
+    "⚔ Bronze → Silver          <b>70P</b>\n"
+    "⚔ Silver → Gold            <b>100P</b>\n"
+    "⚔ Gold → Diamond           <b>120P</b>\n"
+    "⚔ Diamond → Sentry         <b>150P</b>\n"
+    "⚔ Sentry → Soldier         <b>170P</b>\n"
+    "⚔ Soldier → Grenadier      <b>200P</b>\n"
+    "⚔ Grenadier → Sergeant     <b>240P</b>\n"
+    "⚔ Sergeant → Colonel       <b>300P</b>\n"
+    "⚔ Colonel → Lieutenant     <b>350P</b>\n"
+    "⚔ Lieutenant → Ranger      <b>400P</b>\n"
+    "⚔ Ranger → Fusilier        <b>450P</b>\n"
+    "⚔ Fusilier → Gunner        <b>550P</b>\n"
+    "⚔ Gunner → Marine          <b>650P</b>\n"
+    "⚔ Marine → Major           <b>750P</b>\n"
+    "⚔ Major → Brigadier        <b>900P</b>\n"
+    "⚔ Brigadier → Staff Leader  <i>تصمیم مالک</i>"
+)
 
+# ─────────────────────────── Activities ─────────────────────────
+ACTIVITIES = [
+    {"name": "Member From Faction",          "points": 50,  "bonus_ranks": 0},
+    {"name": "Manager From Faction",         "points": 100, "bonus_ranks": 1},
+    {"name": "Sub From Faction",             "points": 120, "bonus_ranks": 1},
+    {"name": "Gun 1K",                       "points": 30,  "bonus_ranks": 0},
+    {"name": "Top Week In Faction",          "points": 80,  "bonus_ranks": 1},
+    {"name": "Top Sub In Season",            "points": 180, "bonus_ranks": 2},
+    {"name": "Top Leader In Season",         "points": 300, "bonus_ranks": 2},
+    {"name": "Family Meeting Participation", "points": 50,  "bonus_ranks": 0},
+    {"name": "Family Event Winner",          "points": 40,  "bonus_ranks": 0},
+    {"name": "Matrix Family Advertisement",  "points": 30,  "bonus_ranks": 0},
+]
+
+# ─────────────────────────── States ─────────────────────────────
+(
+    IDLE,
+    REQ_ACTIVITY,
+    REQ_PROOF,
+    BET_USERNAME,
+    BET_AMOUNT,
+    ADM_ADD_ADMIN,
+    ADM_REMOVE_ADMIN,
+    ADM_BROADCAST,
+    ADM_SET_RANK_USER,
+    ADM_SET_RANK_VALUE,
+    ADM_SET_POINTS_USER,
+    ADM_SET_POINTS_VALUE,
+    ADM_BAN_USER,
+    ADM_REMOVE_USER,
+    ADM_RESTORE,
+) = range(15)
+
+# ─────────────────────────── Button text ────────────────────────
+B_PROFILE    = "👤 پروفایل"
+B_REQ        = "⭐ درخواست امتیاز"
+B_UPGRADE    = "🎖 ارتقای رنک"
+B_LEADER     = "🏆 لیدربرد"
+B_BET        = "🎲 شرط‌بندی"
+B_RANKS      = "📜 رنک‌های فمیلی"
+B_ABOUT      = "ℹ️ About"
+B_ADMIN      = "⚙️ پنل مدیریت"
+B_BACK       = "⬅️ بازگشت"
+B_HOME       = "🏠 منوی اصلی"
+B_ADD_ADM    = "➕ Add Admin"
+B_REM_ADM    = "➖ Remove Admin"
+B_BROADCAST  = "📢 Broadcast"
+B_STATS      = "📊 Statistics"
+B_BACKUP     = "💾 Backup"
+B_RESTORE    = "♻️ Restore Backup"
+B_SET_RANK   = "👤 Set User Rank"
+B_SET_PTS    = "⭐ Set User Points"
+B_BAN        = "🚫 Ban User"
+B_REM_USER   = "🗑 Remove User"
+B_RESET_PTS  = "🔄 Reset All Points"
 
 # ─────────────────────────── Database ───────────────────────────
 def get_db() -> sqlite3.Connection:
@@ -80,19 +164,57 @@ def init_db() -> None:
             value TEXT
         );
         CREATE TABLE IF NOT EXISTS users (
-            user_id    INTEGER PRIMARY KEY,
-            username   TEXT,
-            first_name TEXT,
-            rank_idx   INTEGER DEFAULT 0,
-            points     INTEGER DEFAULT 0,
-            is_admin   INTEGER DEFAULT 0,
-            joined_at  TEXT DEFAULT (datetime('now'))
+            user_id         INTEGER PRIMARY KEY,
+            username        TEXT    DEFAULT '',
+            first_name      TEXT    DEFAULT '',
+            rank_idx        INTEGER DEFAULT 0,
+            points          INTEGER DEFAULT 0,
+            is_admin        INTEGER DEFAULT 0,
+            is_banned       INTEGER DEFAULT 0,
+            total_requests  INTEGER DEFAULT 0,
+            approved_req    INTEGER DEFAULT 0,
+            rejected_req    INTEGER DEFAULT 0,
+            joined_at       TEXT    DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS point_requests (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id        INTEGER NOT NULL,
+            activity_idx   INTEGER NOT NULL,
+            file_id        TEXT    NOT NULL,
+            file_type      TEXT    NOT NULL,
+            status         TEXT    DEFAULT 'pending',
+            reviewer_id    INTEGER,
+            review_at      TEXT,
+            reject_reason  TEXT,
+            created_at     TEXT    DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS bets (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_a   INTEGER NOT NULL,
+            player_b   INTEGER NOT NULL,
+            amount     INTEGER NOT NULL,
+            status     TEXT    DEFAULT 'pending',
+            winner     INTEGER,
+            created_at TEXT    DEFAULT (datetime('now'))
+        );
+        CREATE TABLE IF NOT EXISTS leaderboard_history (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_at    TEXT,
+            snapshot    TEXT
+        );
+        CREATE TABLE IF NOT EXISTS admin_logs (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            admin_id   INTEGER,
+            action     TEXT,
+            target_id  INTEGER,
+            detail     TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
         );
         """)
     log.info("Database initialised at %s", DB_PATH)
 
 
-# ── Settings helpers ──────────────────────────────────────────────
+# ── Settings ──────────────────────────────────────────────────────
 def get_setting(key: str) -> Optional[str]:
     with get_db() as con:
         row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
@@ -105,22 +227,18 @@ def set_setting(key: str, value: str) -> None:
 
 
 def get_owner_id() -> Optional[int]:
-    val = get_setting("owner_id")
-    return int(val) if val else None
+    v = get_setting("owner_id")
+    return int(v) if v else None
 
 
 def claim_owner_atomic(user_id: int) -> bool:
-    """Atomically insert owner_id only if no owner exists. Returns True if this caller won."""
     with get_db() as con:
-        con.execute(
-            "INSERT OR IGNORE INTO settings(key, value) VALUES('owner_id', ?)",
-            (str(user_id),),
-        )
+        con.execute("INSERT OR IGNORE INTO settings(key,value) VALUES('owner_id',?)", (str(user_id),))
         row = con.execute("SELECT value FROM settings WHERE key='owner_id'").fetchone()
         return row is not None and int(row["value"]) == user_id
 
 
-# ── User helpers ──────────────────────────────────────────────────
+# ── Users ─────────────────────────────────────────────────────────
 def upsert_user(user) -> None:
     with get_db() as con:
         con.execute("""
@@ -137,11 +255,37 @@ def get_user(user_id: int) -> Optional[sqlite3.Row]:
         return con.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
 
 
+def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
+    username = username.lstrip("@").lower()
+    with get_db() as con:
+        return con.execute(
+            "SELECT * FROM users WHERE LOWER(username)=?", (username,)
+        ).fetchone()
+
+
+def get_all_users() -> list:
+    with get_db() as con:
+        return con.execute("SELECT * FROM users ORDER BY joined_at DESC").fetchall()
+
+
+def get_leaderboard(limit: int = 10) -> list:
+    with get_db() as con:
+        return con.execute(
+            "SELECT * FROM users WHERE is_banned=0 ORDER BY points DESC, rank_idx DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+
+
 def add_points(user_id: int, amount: int) -> int:
     with get_db() as con:
-        con.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amount, user_id))
+        con.execute("UPDATE users SET points=points+? WHERE user_id=?", (amount, user_id))
         row = con.execute("SELECT points FROM users WHERE user_id=?", (user_id,)).fetchone()
         return row["points"]
+
+
+def set_points(user_id: int, amount: int) -> None:
+    with get_db() as con:
+        con.execute("UPDATE users SET points=? WHERE user_id=?", (amount, user_id))
 
 
 def set_rank(user_id: int, rank_idx: int) -> None:
@@ -151,23 +295,102 @@ def set_rank(user_id: int, rank_idx: int) -> None:
 
 def set_admin(user_id: int, state: bool) -> None:
     with get_db() as con:
-        con.execute("UPDATE users SET is_admin=?, rank_idx=? WHERE user_id=?",
-                    (1 if state else 0, 6 if state else 0, user_id))
+        con.execute("UPDATE users SET is_admin=? WHERE user_id=?", (1 if state else 0, user_id))
 
 
-def get_leaderboard(limit: int = 10) -> list[sqlite3.Row]:
+def set_banned(user_id: int, state: bool) -> None:
     with get_db() as con:
-        return con.execute(
-            "SELECT * FROM users ORDER BY rank_idx DESC, points DESC LIMIT ?", (limit,)
-        ).fetchall()
+        con.execute("UPDATE users SET is_banned=? WHERE user_id=?", (1 if state else 0, user_id))
 
 
-def get_all_users() -> list[sqlite3.Row]:
+def remove_user(user_id: int) -> None:
     with get_db() as con:
-        return con.execute("SELECT * FROM users ORDER BY joined_at DESC").fetchall()
+        con.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+        con.execute("DELETE FROM point_requests WHERE user_id=?", (user_id,))
 
 
-# ── Permission checks ─────────────────────────────────────────────
+def reset_all_points() -> None:
+    with get_db() as con:
+        con.execute("UPDATE users SET points=0")
+
+
+def inc_total_requests(user_id: int) -> None:
+    with get_db() as con:
+        con.execute("UPDATE users SET total_requests=total_requests+1 WHERE user_id=?", (user_id,))
+
+
+def inc_approved(user_id: int) -> None:
+    with get_db() as con:
+        con.execute("UPDATE users SET approved_req=approved_req+1 WHERE user_id=?", (user_id,))
+
+
+def inc_rejected(user_id: int) -> None:
+    with get_db() as con:
+        con.execute("UPDATE users SET rejected_req=rejected_req+1 WHERE user_id=?", (user_id,))
+
+
+# ── Point requests ────────────────────────────────────────────────
+def create_request(user_id: int, activity_idx: int, file_id: str, file_type: str) -> int:
+    with get_db() as con:
+        cur = con.execute(
+            "INSERT INTO point_requests(user_id,activity_idx,file_id,file_type) VALUES(?,?,?,?)",
+            (user_id, activity_idx, file_id, file_type),
+        )
+        return cur.lastrowid
+
+
+def get_request(req_id: int) -> Optional[sqlite3.Row]:
+    with get_db() as con:
+        return con.execute("SELECT * FROM point_requests WHERE id=?", (req_id,)).fetchone()
+
+
+def update_request(req_id: int, status: str, reviewer_id: int, reject_reason: str = "") -> None:
+    with get_db() as con:
+        con.execute(
+            "UPDATE point_requests SET status=?,reviewer_id=?,review_at=datetime('now'),reject_reason=? WHERE id=?",
+            (status, reviewer_id, reject_reason, req_id),
+        )
+
+
+# ── Bets ──────────────────────────────────────────────────────────
+def create_bet(player_a: int, player_b: int, amount: int) -> int:
+    with get_db() as con:
+        cur = con.execute(
+            "INSERT INTO bets(player_a,player_b,amount) VALUES(?,?,?)",
+            (player_a, player_b, amount),
+        )
+        return cur.lastrowid
+
+
+def get_bet(bet_id: int) -> Optional[sqlite3.Row]:
+    with get_db() as con:
+        return con.execute("SELECT * FROM bets WHERE id=?", (bet_id,)).fetchone()
+
+
+def update_bet(bet_id: int, status: str, winner: Optional[int] = None) -> None:
+    with get_db() as con:
+        con.execute("UPDATE bets SET status=?,winner=? WHERE id=?", (status, winner, bet_id))
+
+
+def has_pending_bet(user_id: int) -> bool:
+    with get_db() as con:
+        row = con.execute(
+            "SELECT id FROM bets WHERE (player_a=? OR player_b=?) AND status='pending'",
+            (user_id, user_id),
+        ).fetchone()
+        return row is not None
+
+
+# ── Admin logs ────────────────────────────────────────────────────
+def log_admin_action(admin_id: int, action: str, target_id: int = 0, detail: str = "") -> None:
+    with get_db() as con:
+        con.execute(
+            "INSERT INTO admin_logs(admin_id,action,target_id,detail) VALUES(?,?,?,?)",
+            (admin_id, action, target_id, detail),
+        )
+
+
+# ── Permissions ───────────────────────────────────────────────────
 def is_owner(user_id: int) -> bool:
     return get_owner_id() == user_id
 
@@ -179,576 +402,1373 @@ def is_admin_or_owner(user_id: int) -> bool:
     return bool(u and u["is_admin"])
 
 
+def is_banned(user_id: int) -> bool:
+    u = get_user(user_id)
+    return bool(u and u["is_banned"])
+
+
 # ─────────────────────────── Keyboards ──────────────────────────
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👤 پروفایل من",   callback_data="profile"),
-            InlineKeyboardButton("🏆 رتبه‌ها",       callback_data="ranks"),
-        ],
-        [
-            InlineKeyboardButton("📊 امتیاز من",    callback_data="mypoints"),
-            InlineKeyboardButton("🏅 تابلو برترین‌ها", callback_data="leaderboard"),
-        ],
-        [
-            InlineKeyboardButton("⬆️ ارتقا رتبه",   callback_data="upgrade"),
-            InlineKeyboardButton("ℹ️ راهنما",        callback_data="help"),
-        ],
+def _kb(buttons: list[list[str]], resize: bool = True) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(t) for t in row] for row in buttons],
+        resize_keyboard=resize,
+        input_field_placeholder="گزینه‌ای انتخاب کنید…",
+    )
+
+
+def main_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [B_PROFILE, B_REQ],
+        [B_UPGRADE, B_LEADER],
+        [B_BET, B_RANKS],
+        [B_ABOUT],
+    ]
+    if is_admin_or_owner(user_id):
+        rows.append([B_ADMIN])
+    return _kb(rows)
+
+
+def nav_kb(extra: list[list[str]] | None = None) -> ReplyKeyboardMarkup:
+    rows = extra or []
+    rows.append([B_BACK, B_HOME])
+    return _kb(rows)
+
+
+def activity_kb() -> ReplyKeyboardMarkup:
+    rows = [[a["name"]] for a in ACTIVITIES]
+    rows.append([B_BACK, B_HOME])
+    return _kb(rows)
+
+
+def admin_panel_kb() -> ReplyKeyboardMarkup:
+    return _kb([
+        [B_ADD_ADM, B_REM_ADM],
+        [B_BROADCAST, B_STATS],
+        [B_BACKUP, B_RESTORE],
+        [B_SET_RANK, B_SET_PTS],
+        [B_BAN, B_REM_USER],
+        [B_RESET_PTS],
+        [B_HOME],
     ])
-
-
-def admin_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👥 لیست اعضا",       callback_data="adm_members"),
-            InlineKeyboardButton("🎁 دادن امتیاز",      callback_data="adm_givepoints"),
-        ],
-        [
-            InlineKeyboardButton("🛡 انتصاب ادمین",     callback_data="adm_setadmin"),
-            InlineKeyboardButton("⭐ تایید VIP",        callback_data="adm_setvip"),
-        ],
-        [
-            InlineKeyboardButton("📢 اطلاع‌رسانی",      callback_data="adm_broadcast"),
-            InlineKeyboardButton("📈 آمار ربات",        callback_data="adm_stats"),
-        ],
-        [InlineKeyboardButton("🔙 برگشت", callback_data="back_main")],
-    ])
-
-
-def back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="back_main")]])
 
 
 # ─────────────────────────── Helpers ────────────────────────────
-def rank_info(idx: int) -> dict:
-    return RANKS[idx] if 0 <= idx < len(RANKS) else RANKS[0]
+def rank_name(idx: int) -> str:
+    return RANKS[idx] if 0 <= idx < len(RANKS) else "Unknown"
+
+
+def leaderboard_position(user_id: int) -> int:
+    with get_db() as con:
+        rows = con.execute(
+            "SELECT user_id FROM users WHERE is_banned=0 ORDER BY points DESC, rank_idx DESC"
+        ).fetchall()
+    for i, r in enumerate(rows, 1):
+        if r["user_id"] == user_id:
+            return i
+    return 0
 
 
 def profile_text(u: sqlite3.Row) -> str:
-    r = rank_info(u["rank_idx"])
+    pos = leaderboard_position(u["user_id"])
     owner_id = get_owner_id()
-    badge = ""
+    role = ""
     if owner_id and u["user_id"] == owner_id:
-        badge = "  👑 مالک"
+        role = "  👑 مالک"
     elif u["is_admin"]:
-        badge = "  🛡 ادمین"
+        role = "  🛡 ادمین"
     return (
-        f"╔══ 👤 پروفایل شما ══╗\n"
-        f"┃ نام: <b>{u['first_name']}</b>{badge}\n"
-        f"┃ یوزرنیم: @{u['username'] or '—'}\n"
-        f"┃ رتبه: {r['name']}\n"
-        f"┃ امتیاز: <b>{u['points']:,}</b>\n"
-        f"┃ عضو از: {u['joined_at'][:10]}\n"
-        f"╚══════════════════╝"
+        f"👤 <b>به پروفایل Matrix-Family خوش آمدید</b>\n\n"
+        f"┌──────────────────────\n"
+        f"│ 📛 نام: <b>{u['first_name']}</b>{role}\n"
+        f"│ 🆔 یوزرنیم: @{u['username'] or '—'}\n"
+        f"│ 🔢 Telegram ID: <code>{u['user_id']}</code>\n"
+        f"│ 🎖 رنک: <b>{rank_name(u['rank_idx'])}</b>\n"
+        f"│ ⭐ امتیاز: <b>{u['points']:,}</b>\n"
+        f"│ 🏆 رتبه لیدربرد: <b>#{pos}</b>\n"
+        f"│ 📤 کل درخواست‌ها: {u['total_requests']}\n"
+        f"│ ✅ تایید شده: {u['approved_req']}\n"
+        f"│ ❌ رد شده: {u['rejected_req']}\n"
+        f"│ 📅 عضو از: {u['joined_at'][:10]}\n"
+        f"└──────────────────────"
     )
 
 
-# ─────────────────────────── Handlers ───────────────────────────
-
-# /start
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    upsert_user(user)
-    log.info("/start from user_id=%s (%s)", user.id, user.first_name)
-    await update.message.reply_text(
-        f"سلام <b>{user.first_name}</b>! 👋\n"
-        "به <b>Matrix Family Bot</b> خوش اومدی 🌟\n"
-        "از منوی زیر انتخاب کن:",
-        reply_markup=main_menu_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# /setowner  — one-time bootstrap, secure against hijack
-async def cmd_setowner(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    upsert_user(user)
-    existing = get_owner_id()
-
-    # Rule 1: env override takes precedence
-    env_owner = int(os.environ.get("OWNER_ID", "0"))
-    if env_owner and env_owner != user.id:
-        return  # silently ignore
-
-    # Rule 2: DB owner exists and it's not us → silently ignore
-    if existing and existing != user.id:
-        return
-
-    # Rule 3: already owner
-    if existing == user.id:
-        await update.message.reply_text("✅ شما قبلاً مالک این ربات هستید.")
-        return
-
-    # First-time claim — atomic: only one caller wins the race
-    won = claim_owner_atomic(user.id)
-    if not won:
-        return  # another concurrent request got there first — silently ignore
-    set_rank(user.id, 7)  # Owner rank
-    log.info("Owner set: user_id=%s (%s)", user.id, user.first_name)
-    await update.message.reply_text(
-        "👑 تبریک! شما مالک این ربات شدید.\n"
-        "از /admin برای پنل مدیریت استفاده کن.",
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# /admin
-async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    upsert_user(user)
-    if not is_admin_or_owner(user.id):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return
-    badge = "👑 مالک" if is_owner(user.id) else "🛡 ادمین"
-    await update.message.reply_text(
-        f"🔐 پنل مدیریت — <b>{badge}</b>\nیک گزینه انتخاب کنید:",
-        reply_markup=admin_menu_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# /myinfo
-async def cmd_myinfo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    upsert_user(user)
-    u = get_user(user.id)
-    await update.message.reply_text(
-        profile_text(u),
-        reply_markup=back_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# /ranks
-async def cmd_ranks(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    lines = ["🏆 <b>جدول رتبه‌ها</b>\n"]
-    for i, r in enumerate(RANKS):
-        if r["special"]:
-            lines.append(f"{i}. {r['name']} — <i>ویژه: {r['special']}</i>")
-        elif r["points"] == 0:
-            lines.append(f"{i}. {r['name']} — رایگان")
-        else:
-            lines.append(f"{i}. {r['name']} — هزینه: <b>{r['points']:,}</b> امتیاز")
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=back_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# /leaderboard
-async def cmd_leaderboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    rows = get_leaderboard(10)
-    if not rows:
-        await update.message.reply_text("هنوز اعضایی ثبت نشده‌اند.")
-        return
-    lines = ["🏅 <b>برترین اعضا</b>\n"]
-    medals = ["🥇", "🥈", "🥉"]
-    for i, u in enumerate(rows):
-        m = medals[i] if i < 3 else f"{i+1}."
-        r = rank_info(u["rank_idx"])
-        lines.append(f"{m} {u['first_name']} — {r['emoji']} {u['points']:,} امتیاز")
-    await update.message.reply_text(
-        "\n".join(lines),
-        reply_markup=back_kb(),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-# /status
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+def stats_text() -> str:
+    all_users = get_all_users()
+    total = len(all_users)
+    admins = sum(1 for u in all_users if u["is_admin"])
+    banned = sum(1 for u in all_users if u["is_banned"])
+    total_pts = sum(u["points"] for u in all_users)
     uptime = time.time() - _start_time
     h, rem = divmod(int(uptime), 3600)
     m, s = divmod(rem, 60)
+    return (
+        f"📊 <b>Statistics — Matrix-Family Bot</b>\n\n"
+        f"👥 کل اعضا: <b>{total}</b>\n"
+        f"🛡 ادمین‌ها: <b>{admins}</b>\n"
+        f"🚫 بن‌شده: <b>{banned}</b>\n"
+        f"⭐ کل امتیازها: <b>{total_pts:,}</b>\n"
+        f"⏱ آپتایم: <b>{h:02d}:{m:02d}:{s:02d}</b>"
+    )
+
+
+async def notify_admins(app: Application, text: str, reply_markup=None, **kwargs) -> None:
+    """Send a message to all admins and the owner."""
     owner_id = get_owner_id()
-    member_count = len(get_all_users())
+    recipients = set()
+    if owner_id:
+        recipients.add(owner_id)
+    with get_db() as con:
+        rows = con.execute("SELECT user_id FROM users WHERE is_admin=1").fetchall()
+    for r in rows:
+        recipients.add(r["user_id"])
+    for uid in recipients:
+        try:
+            await app.bot.send_message(
+                uid, text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, **kwargs
+            )
+        except Exception as e:
+            log.warning("Could not notify admin %s: %s", uid, e)
+
+
+# ─────────────────────────── /start ─────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    upsert_user(user)
+
+    # Ban check
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 حساب شما مسدود شده است.")
+        return ConversationHandler.END
+
+    # First-time owner claim
+    if not get_owner_id():
+        won = claim_owner_atomic(user.id)
+        if won:
+            set_rank(user.id, len(RANKS) - 1)  # Staff Leader
+            log.info("Owner set: user_id=%s (%s)", user.id, user.first_name)
+            await update.message.reply_text(
+                "👑 <b>تبریک! شما اولین مالک این ربات شدید.</b>\n"
+                "از دکمه ⚙️ پنل مدیریت برای کنترل کامل استفاده کنید.",
+                reply_markup=main_menu_kb(user.id),
+                parse_mode=ParseMode.HTML,
+            )
+            return IDLE
+
     await update.message.reply_text(
-        f"🟢 <b>ربات آنلاین است</b>\n"
-        f"⏱ آپتایم: <b>{h:02d}:{m:02d}:{s:02d}</b>\n"
-        f"👥 اعضا: <b>{member_count}</b>\n"
-        f"👑 مالک ثبت‌شده: {'✅' if owner_id else '❌ هنوز /setowner نزدید'}\n"
-        f"📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"🏠 <b>Matrix-Family Bot</b>\nسلام <b>{user.first_name}</b>! 👋\nاز منوی زیر انتخاب کنید:",
+        reply_markup=main_menu_kb(user.id),
         parse_mode=ParseMode.HTML,
     )
+    return IDLE
 
 
-# /help
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+# ─────────────────────────── IDLE dispatcher ─────────────────────
+async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = update.message.text or ""
+
+    # Ban check on every message
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 حساب شما مسدود شده است.")
+        return ConversationHandler.END
+
+    upsert_user(user)
+
+    # ── Check if this admin is waiting to enter rejection reason ──
+    if "awaiting_reject_req_id" in ctx.user_data and is_admin_or_owner(user.id):
+        req_id = ctx.user_data.pop("awaiting_reject_req_id")
+        reason = text.strip()
+        req = get_request(req_id)
+        if req and req["status"] == "rejecting":
+            update_request(req_id, "rejected", user.id, reason)
+            inc_rejected(req["user_id"])
+            log_admin_action(user.id, "reject_request", req["user_id"], f"req#{req_id}: {reason}")
+            try:
+                act = ACTIVITIES[req["activity_idx"]]
+                await ctx.bot.send_message(
+                    req["user_id"],
+                    f"❌ <b>درخواست امتیاز شما رد شد</b>\n\n"
+                    f"فعالیت: {act['name']}\n"
+                    f"دلیل: <i>{reason}</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                log.warning("Could not notify user %s of rejection: %s", req["user_id"], e)
+        await update.message.reply_text(
+            "✅ دلیل رد به کاربر ارسال شد.",
+            reply_markup=main_menu_kb(user.id),
+        )
+        return IDLE
+
+    # ── Main menu buttons ──
+    if text == B_PROFILE:
+        u = get_user(user.id)
+        await update.message.reply_text(
+            profile_text(u),
+            reply_markup=nav_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+        return IDLE
+
+    elif text == B_RANKS:
+        await update.message.reply_text(
+            RANK_TABLE, reply_markup=nav_kb(), parse_mode=ParseMode.HTML
+        )
+        return IDLE
+
+    elif text == B_LEADER:
+        rows = get_leaderboard(20)
+        medals = ["🥇", "🥈", "🥉"]
+        lines = ["🏆 <b>به پنل لیدربرد Matrix-Family خوش آمدید</b>\n"]
+        if not rows:
+            lines.append("هنوز اعضایی ثبت نشده‌اند.")
+        for i, r in enumerate(rows):
+            medal = medals[i] if i < 3 else f"{i+1}."
+            lines.append(
+                f"{medal} <b>{r['first_name']}</b>  @{r['username'] or '—'}\n"
+                f"   🎖 {rank_name(r['rank_idx'])}  |  ⭐ {r['points']:,}P"
+            )
+        await update.message.reply_text(
+            "\n".join(lines), reply_markup=nav_kb(), parse_mode=ParseMode.HTML
+        )
+        return IDLE
+
+    elif text == B_ABOUT:
+        await update.message.reply_text(
+            "ℹ️ <b>Matrix-Family Bot</b>\n\n"
+            "<b>هدف:</b>\n"
+            "این ربات سیستم امتیاز و رتبه‌بندی خانواده Matrix را مدیریت می‌کند.\n\n"
+            "<b>سیستم امتیاز:</b>\n"
+            "با انجام فعالیت‌های مختلف امتیاز کسب کنید. درخواست ارسال کنید، ادمین تایید می‌کند، امتیاز دریافت می‌کنید.\n\n"
+            "<b>سیستم رنک:</b>\n"
+            "با امتیاز کافی رنک خود را ارتقا دهید. از Members تا Staff Leader.\n\n"
+            "<b>شرط‌بندی:</b>\n"
+            "با اعضای دیگر شرط ببندید. برنده امتیاز می‌گیرد، بازنده کم می‌کند.\n\n"
+            "<b>لیدربرد:</b>\n"
+            "هر ۲۲ روز یک‌بار ۳ نفر برتر جایزه می‌گیرند.\n\n"
+            "👨‍💻 <b>Developer:</b> سپهر (ماتریکس) — @oovqx",
+            reply_markup=nav_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+        return IDLE
+
+    elif text == B_UPGRADE:
+        u = get_user(user.id)
+        cur_idx = u["rank_idx"]
+        rn = rank_name(cur_idx)
+
+        if cur_idx >= len(RANKS) - 1:
+            await update.message.reply_text(
+                f"🏆 رنک فعلی: <b>{rn}</b>\nشما به بالاترین رنک رسیده‌اید!",
+                reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+            )
+            return IDLE
+
+        if cur_idx >= MAX_AUTO_RANK:
+            await update.message.reply_text(
+                f"🎖 رنک فعلی: <b>{rn}</b>\nارتقا به Staff Leader نیاز به تایید مالک دارد.",
+                reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+            )
+            return IDLE
+
+        next_idx = cur_idx + 1
+        cost = RANK_COSTS[next_idx]
+        balance = u["points"]
+        can = balance >= cost
+
+        text_body = (
+            f"🎖 <b>ارتقای رنک</b>\n\n"
+            f"رنک فعلی: <b>{rn}</b>\n"
+            f"رنک بعدی: <b>{rank_name(next_idx)}</b>\n"
+            f"هزینه: <b>{cost:,}P</b>\n"
+            f"موجودی شما: <b>{balance:,}P</b>\n\n"
+        )
+
+        if can:
+            # Do the upgrade
+            with get_db() as con:
+                result = con.execute(
+                    "UPDATE users SET points=points-?,rank_idx=? "
+                    "WHERE user_id=? AND rank_idx=? AND points>=?",
+                    (cost, next_idx, user.id, cur_idx, cost),
+                )
+            if result.rowcount:
+                log.info("Rank upgrade: user=%s → %s (cost %sP)", user.id, next_idx, cost)
+                await update.message.reply_text(
+                    text_body + f"🎉 <b>تبریک! به رنک {rank_name(next_idx)} ارتقا یافتید!</b>\n"
+                    f"{cost:,}P از موجودی شما کسر شد.",
+                    reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+                )
+            else:
+                await update.message.reply_text(
+                    text_body + "❌ ارتقا انجام نشد — وضعیت تغییر کرده، دوباره تلاش کنید.",
+                    reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+                )
+        else:
+            await update.message.reply_text(
+                text_body + f"❌ امتیاز کافی ندارید. {cost - balance:,}P بیشتر نیاز دارید.",
+                reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+            )
+        return IDLE
+
+    elif text == B_REQ:
+        await update.message.reply_text(
+            "⭐ <b>به پنل درخواست امتیاز Matrix-Family خوش آمدید</b>\n\n"
+            "فعالیت مورد نظر را انتخاب کنید:",
+            reply_markup=activity_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+        return REQ_ACTIVITY
+
+    elif text == B_BET:
+        u = get_user(user.id)
+        if has_pending_bet(user.id):
+            await update.message.reply_text(
+                "⚠️ شما یک شرط‌بندی فعال دارید. ابتدا آن را تمام کنید.",
+                reply_markup=nav_kb(),
+            )
+            return IDLE
+        await update.message.reply_text(
+            "🎲 <b>شرط‌بندی</b>\n\nیوزرنیم حریف را وارد کنید (بدون @):",
+            reply_markup=nav_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+        return BET_USERNAME
+
+    elif text == B_ADMIN:
+        if not is_admin_or_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            "⚙️ <b>پنل مدیریت — Matrix-Family</b>\n\nگزینه‌ای انتخاب کنید:",
+            reply_markup=admin_panel_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+        return IDLE
+
+    # ── Admin panel buttons ──
+    elif text == B_ADD_ADM:
+        if not is_owner(user.id):
+            await update.message.reply_text("⛔ فقط مالک می‌تواند ادمین اضافه کند.")
+            return IDLE
+        await update.message.reply_text(
+            "➕ <b>Add Admin</b>\n\nUser ID یا یوزرنیم کاربر را وارد کنید:",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_ADD_ADMIN
+
+    elif text == B_REM_ADM:
+        if not is_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            "➖ <b>Remove Admin</b>\n\nUser ID یا یوزرنیم ادمین را وارد کنید:",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_REMOVE_ADMIN
+
+    elif text == B_BROADCAST:
+        if not is_admin_or_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            "📢 <b>Broadcast</b>\n\nمتن پیام را وارد کنید:",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_BROADCAST
+
+    elif text == B_STATS:
+        if not is_admin_or_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            stats_text(), reply_markup=admin_panel_kb(), parse_mode=ParseMode.HTML
+        )
+        return IDLE
+
+    elif text == B_BACKUP:
+        if not is_admin_or_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = BACKUP_DIR / f"family_{ts}.db"
+        shutil.copy2(DB_PATH, backup_path)
+        log_admin_action(user.id, "backup", 0, str(backup_path))
+        log.info("Backup created: %s", backup_path)
+        await update.message.reply_text("💾 در حال ارسال فایل پشتیبان…", reply_markup=admin_panel_kb())
+        with open(backup_path, "rb") as f:
+            await ctx.bot.send_document(
+                user.id, f,
+                filename=backup_path.name,
+                caption=f"💾 <b>Backup — {ts}</b>",
+                parse_mode=ParseMode.HTML,
+            )
+        return IDLE
+
+    elif text == B_RESTORE:
+        if not is_owner(user.id):
+            await update.message.reply_text("⛔ فقط مالک می‌تواند بازیابی کند.")
+            return IDLE
+        await update.message.reply_text(
+            "♻️ <b>Restore Backup</b>\n\n"
+            "فایل پشتیبان (.db) را ارسال کنید.\n"
+            "<b>⚠️ این عمل داده‌های فعلی را جایگزین می‌کند!</b>",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_RESTORE
+
+    elif text == B_SET_RANK:
+        if not is_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            "👤 <b>Set User Rank</b>\n\nUser ID کاربر را وارد کنید:",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_SET_RANK_USER
+
+    elif text == B_SET_PTS:
+        if not is_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            "⭐ <b>Set User Points</b>\n\nUser ID کاربر را وارد کنید:",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_SET_POINTS_USER
+
+    elif text == B_BAN:
+        if not is_admin_or_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            "🚫 <b>Ban User</b>\n\nUser ID کاربر را وارد کنید:",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_BAN_USER
+
+    elif text == B_REM_USER:
+        if not is_admin_or_owner(user.id):
+            await update.message.reply_text("⛔ دسترسی ندارید.")
+            return IDLE
+        await update.message.reply_text(
+            "🗑 <b>Remove User</b>\n\nUser ID کاربر را وارد کنید:",
+            reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
+        )
+        return ADM_REMOVE_USER
+
+    elif text == B_RESET_PTS:
+        if not is_owner(user.id):
+            await update.message.reply_text("⛔ فقط مالک می‌تواند این کار را انجام دهد.")
+            return IDLE
+        reset_all_points()
+        log_admin_action(user.id, "reset_all_points")
+        await update.message.reply_text(
+            "🔄 امتیاز همه اعضا صفر شد.",
+            reply_markup=admin_panel_kb(),
+        )
+        return IDLE
+
+    elif text in (B_BACK, B_HOME):
+        await update.message.reply_text(
+            "🏠 منوی اصلی",
+            reply_markup=main_menu_kb(user.id),
+        )
+        return IDLE
+
+    else:
+        await update.message.reply_text(
+            "❓ گزینه‌ای انتخاب نشد. از منوی زیر استفاده کنید:",
+            reply_markup=main_menu_kb(user.id),
+        )
+        return IDLE
+
+
+# ─────────────────────────── Point request flow ──────────────────
+async def req_activity(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = update.message.text or ""
+
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    # Match activity
+    act_idx = next((i for i, a in enumerate(ACTIVITIES) if a["name"] == text), None)
+    if act_idx is None:
+        await update.message.reply_text(
+            "❓ فعالیت شناخته نشد. یکی از گزینه‌های زیر را انتخاب کنید:",
+            reply_markup=activity_kb(),
+        )
+        return REQ_ACTIVITY
+
+    ctx.user_data["req_activity_idx"] = act_idx
+    act = ACTIVITIES[act_idx]
     await update.message.reply_text(
-        "📖 <b>راهنمای دستورات</b>\n\n"
-        "<b>عمومی:</b>\n"
-        "/start — منوی اصلی\n"
-        "/myinfo — پروفایل من\n"
-        "/ranks — جدول رتبه‌ها\n"
-        "/leaderboard — برترین اعضا\n"
-        "/status — وضعیت ربات\n\n"
-        "<b>ادمین/مالک:</b>\n"
-        "/admin — پنل مدیریت\n"
-        "/givepoints [user_id] [amount] — دادن امتیاز\n"
-        "/setadmin [user_id] — انتصاب ادمین\n"
-        "/removeadmin [user_id] — حذف ادمین\n"
-        "/setvip [user_id] — تایید VIP\n"
-        "/broadcast [پیام] — اطلاع‌رسانی\n\n"
-        "<b>اولین راه‌اندازی:</b>\n"
-        "/setowner — یک‌بار اجرا کنید تا مالک شوید",
-        reply_markup=back_kb(),
+        f"📎 <b>فعالیت انتخابی:</b> {act['name']}\n"
+        f"⭐ امتیاز: <b>{act['points']}P</b>"
+        + (f"\n🎖 بونوس رنک: +{act['bonus_ranks']}" if act["bonus_ranks"] else "")
+        + "\n\n📸 حالا مدرک (عکس، ویدیو یا فایل) را ارسال کنید:",
+        reply_markup=nav_kb(),
         parse_mode=ParseMode.HTML,
     )
+    return REQ_PROOF
 
 
-# /givepoints [user_id] [amount]
-async def cmd_givepoints(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_or_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
+async def req_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    msg = update.message
+
+    if msg.text and msg.text in (B_BACK, B_HOME):
+        await msg.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    # Determine file type and ID
+    file_id = None
+    file_type = None
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        file_type = "photo"
+    elif msg.video:
+        file_id = msg.video.file_id
+        file_type = "video"
+    elif msg.document:
+        file_id = msg.document.file_id
+        file_type = "document"
+
+    if not file_id:
+        await msg.reply_text(
+            "⚠️ لطفاً یک عکس، ویدیو یا فایل ارسال کنید:",
+            reply_markup=nav_kb(),
+        )
+        return REQ_PROOF
+
+    act_idx = ctx.user_data.get("req_activity_idx", 0)
+    req_id = create_request(user.id, act_idx, file_id, file_type)
+    inc_total_requests(user.id)
+
+    u = get_user(user.id)
+    act = ACTIVITIES[act_idx]
+
+    # Notify admins + owner
+    approve_kb = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ تایید", callback_data=f"approve_{req_id}"),
+            InlineKeyboardButton("❌ رد", callback_data=f"reject_{req_id}"),
+        ]
+    ])
+    notice = (
+        f"📥 <b>درخواست امتیاز جدید #{req_id}</b>\n\n"
+        f"👤 کاربر: {u['first_name']} (@{u['username'] or '—'})\n"
+        f"🆔 ID: <code>{user.id}</code>\n"
+        f"🏷 فعالیت: <b>{act['name']}</b>\n"
+        f"⭐ امتیاز: <b>{act['points']}P</b>"
+        + (f"\n🎖 بونوس رنک: +{act['bonus_ranks']}" if act["bonus_ranks"] else "")
+    )
+
+    owner_id = get_owner_id()
+    recipients = set()
+    if owner_id:
+        recipients.add(owner_id)
+    with get_db() as con:
+        rows = con.execute("SELECT user_id FROM users WHERE is_admin=1").fetchall()
+    for r in rows:
+        recipients.add(r["user_id"])
+
+    for uid in recipients:
+        try:
+            # Send the proof file first, then the notice with buttons
+            if file_type == "photo":
+                await ctx.bot.send_photo(uid, file_id, caption=notice,
+                                         parse_mode=ParseMode.HTML, reply_markup=approve_kb)
+            elif file_type == "video":
+                await ctx.bot.send_video(uid, file_id, caption=notice,
+                                         parse_mode=ParseMode.HTML, reply_markup=approve_kb)
+            else:
+                await ctx.bot.send_document(uid, file_id, caption=notice,
+                                            parse_mode=ParseMode.HTML, reply_markup=approve_kb)
+        except Exception as e:
+            log.warning("Could not notify admin %s of request: %s", uid, e)
+
+    await msg.reply_text(
+        f"✅ <b>درخواست شما ثبت شد!</b>\n\n"
+        f"شماره درخواست: <b>#{req_id}</b>\n"
+        f"فعالیت: {act['name']}\n\n"
+        "پس از بررسی توسط ادمین، نتیجه به شما اطلاع داده خواهد شد.",
+        reply_markup=main_menu_kb(user.id),
+        parse_mode=ParseMode.HTML,
+    )
+    ctx.user_data.pop("req_activity_idx", None)
+    return IDLE
+
+
+# ─────────────────────────── Approve / Reject callbacks ──────────
+async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    admin = q.from_user
+
+    if not is_admin_or_owner(admin.id):
+        await q.answer("⛔ دسترسی ندارید.", show_alert=True)
         return
-    args = ctx.args
-    if len(args) < 2:
-        await update.message.reply_text("استفاده: /givepoints [user_id] [مقدار]")
-        return
+
+    req_id = int(q.data.split("_")[1])
+
+    # Atomic status transition — only one admin wins the race
+    with get_db() as con:
+        result = con.execute(
+            "UPDATE point_requests SET status='approved', reviewer_id=?, review_at=datetime('now') "
+            "WHERE id=? AND status='pending'",
+            (admin.id, req_id),
+        )
+        if result.rowcount == 0:
+            # Already reviewed by another admin
+            req = con.execute("SELECT status FROM point_requests WHERE id=?", (req_id,)).fetchone()
+            status = req["status"] if req else "unknown"
+            await q.answer(f"این درخواست قبلاً بررسی شده ({status}).", show_alert=True)
+            return
+        req = con.execute("SELECT * FROM point_requests WHERE id=?", (req_id,)).fetchone()
+        u = con.execute("SELECT * FROM users WHERE user_id=?", (req["user_id"],)).fetchone()
+        if not u:
+            await q.answer("کاربر یافت نشد.", show_alert=True)
+            return
+        act = ACTIVITIES[req["activity_idx"]]
+        # Apply points and bonus ranks in same transaction
+        con.execute("UPDATE users SET points=points+?, approved_req=approved_req+1 WHERE user_id=?",
+                    (act["points"], req["user_id"]))
+        new_pts = con.execute("SELECT points FROM users WHERE user_id=?", (req["user_id"],)).fetchone()["points"]
+        new_rank_idx = u["rank_idx"]
+        if act["bonus_ranks"] > 0:
+            new_rank_idx = min(u["rank_idx"] + act["bonus_ranks"], len(RANKS) - 1)
+            con.execute("UPDATE users SET rank_idx=? WHERE user_id=?", (new_rank_idx, req["user_id"]))
+
+    log_admin_action(admin.id, "approve_request", req["user_id"],
+                     f"req#{req_id} +{act['points']}P +{act['bonus_ranks']}rank")
+    log.info("Approved req#%s for user %s: +%sP +%srank", req_id, req["user_id"],
+             act["points"], act["bonus_ranks"])
+
+    # Notify user
     try:
-        uid, amount = int(args[0]), int(args[1])
-    except ValueError:
-        await update.message.reply_text("❌ مقادیر نامعتبر. باید عدد باشند.")
-        return
-    if amount <= 0:
-        await update.message.reply_text("❌ مقدار امتیاز باید مثبت باشد.")
-        return
-    target = get_user(uid)
-    if not target:
-        await update.message.reply_text(f"❌ کاربر {uid} در دیتابیس ربات پیدا نشد.\nکاربر باید ابتدا /start را زده باشد.")
-        return
-    new_bal = add_points(uid, amount)
-    await update.message.reply_text(
-        f"✅ {amount:,} امتیاز به کاربر {uid} داده شد.\n"
-        f"موجودی جدید: <b>{new_bal:,}</b>",
-        parse_mode=ParseMode.HTML,
-    )
-    try:
-        await ctx.bot.send_message(uid, f"🎁 <b>{amount:,} امتیاز</b> دریافت کردید!\nموجودی: {new_bal:,}", parse_mode=ParseMode.HTML)
+        msg = (
+            f"✅ <b>درخواست امتیاز شما تایید شد!</b>\n\n"
+            f"فعالیت: {act['name']}\n"
+            f"⭐ امتیاز دریافتی: <b>+{act['points']}P</b>\n"
+            f"💰 موجودی جدید: <b>{new_pts:,}P</b>"
+        )
+        if act["bonus_ranks"]:
+            msg += f"\n🎖 رنک جدید: <b>{rank_name(new_rank_idx)}</b>"
+        await ctx.bot.send_message(req["user_id"], msg, parse_mode=ParseMode.HTML)
     except Exception as e:
-        log.warning("Could not notify user %s about points: %s", uid, e)
+        log.warning("Could not notify user %s of approval: %s", req["user_id"], e)
 
-
-# /setadmin [user_id]
-async def cmd_setadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ فقط مالک می‌تواند ادمین منصوب کند.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("استفاده: /setadmin [user_id]")
-        return
+    # Edit admin message
     try:
-        uid = int(ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id باید عدد باشد.")
-        return
-    if not get_user(uid):
-        await update.message.reply_text(f"❌ کاربر {uid} در دیتابیس یافت نشد.")
-        return
-    set_admin(uid, True)
-    await update.message.reply_text(f"✅ کاربر {uid} به عنوان ادمین منصوب شد.")
-    try:
-        await ctx.bot.send_message(uid, "🛡 شما به عنوان <b>ادمین</b> منصوب شدید!", parse_mode=ParseMode.HTML)
-    except Exception as e:
-        log.warning("Could not notify admin %s: %s", uid, e)
-
-
-# /removeadmin [user_id]
-async def cmd_removeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ فقط مالک می‌تواند ادمین را حذف کند.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("استفاده: /removeadmin [user_id]")
-        return
-    try:
-        uid = int(ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id باید عدد باشد.")
-        return
-    if not get_user(uid):
-        await update.message.reply_text(f"❌ کاربر {uid} در دیتابیس یافت نشد.")
-        return
-    set_admin(uid, False)
-    await update.message.reply_text(f"✅ دسترسی ادمین کاربر {uid} حذف شد.")
-
-
-# /setvip [user_id]
-async def cmd_setvip(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_or_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("استفاده: /setvip [user_id]")
-        return
-    try:
-        uid = int(ctx.args[0])
-    except ValueError:
-        await update.message.reply_text("❌ user_id باید عدد باشد.")
-        return
-    u = get_user(uid)
-    if not u:
-        await update.message.reply_text("❌ کاربر پیدا نشد.")
-        return
-    if u["rank_idx"] >= 5:
-        await update.message.reply_text("کاربر قبلاً VIP یا بالاتر است.")
-        return
-    set_rank(uid, 5)
-    await update.message.reply_text(f"✅ کاربر {uid} به ⭐ VIP ارتقا یافت.")
-    try:
-        await ctx.bot.send_message(uid, "⭐ تبریک! شما به رتبه <b>VIP</b> ارتقا یافتید!", parse_mode=ParseMode.HTML)
+        existing = q.message.caption or ""
+        await q.edit_message_caption(
+            existing + f"\n\n✅ <b>تایید شد توسط</b> {admin.first_name}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=None,
+        )
     except Exception:
         pass
 
 
-# /broadcast [message]
-async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin_or_owner(update.effective_user.id):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return
-    if not ctx.args:
-        await update.message.reply_text("استفاده: /broadcast [متن پیام]")
-        return
-    text = " ".join(ctx.args)
-    users = get_all_users()
-    sent, failed = 0, 0
-    for u in users:
-        try:
-            await ctx.bot.send_message(u["user_id"], f"📢 <b>اطلاعیه:</b>\n\n{text}", parse_mode=ParseMode.HTML)
-            sent += 1
-        except Exception:
-            failed += 1
-    await update.message.reply_text(f"✅ پیام ارسال شد.\n✉️ موفق: {sent}\n❌ ناموفق: {failed}")
-
-
-# ─────────────────────────── Upgrade flow ───────────────────────
-async def show_upgrade(update: Update, u: sqlite3.Row, edit: bool = False) -> None:
-    cur_idx = u["rank_idx"]
-    r_cur = rank_info(cur_idx)
-    msg_obj = update.callback_query.message if edit else update.message
-
-    if cur_idx >= MAX_PURCHASABLE_RANK:
-        text = (
-            f"رتبه فعلی شما: {r_cur['name']}\n\n"
-            "شما به بالاترین رتبه قابل خرید رسیده‌اید! 🎉\n"
-            "رتبه‌های بالاتر (VIP، ادمین) نیاز به تایید دارند."
-        )
-        kb = back_kb()
-    else:
-        next_idx = cur_idx + 1
-        r_next = rank_info(next_idx)
-        cost = r_next["points"]
-        balance = u["points"]
-        can_buy = balance >= cost
-        text = (
-            f"رتبه فعلی: {r_cur['name']}\n"
-            f"رتبه بعدی: {r_next['name']}\n"
-            f"هزینه ارتقا: <b>{cost:,}</b> امتیاز\n"
-            f"موجودی شما: <b>{balance:,}</b> امتیاز\n\n"
-            f"{'✅ می‌توانید ارتقا دهید!' if can_buy else '❌ امتیاز کافی ندارید.'}"
-        )
-        buttons = []
-        if can_buy:
-            buttons.append(InlineKeyboardButton(f"⬆️ ارتقا به {r_next['name']}", callback_data=f"buy_rank_{next_idx}"))
-        buttons_row = [buttons] if buttons else []
-        buttons_row.append([InlineKeyboardButton("🔙 برگشت", callback_data="back_main")])
-        kb = InlineKeyboardMarkup(buttons_row)
-
-    if edit:
-        await msg_obj.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-    else:
-        await msg_obj.reply_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
-
-
-# ─────────────────────────── Callback queries ────────────────────
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
-    user = q.from_user
-    upsert_user(user)
-    u = get_user(user.id)
-    data = q.data
+    admin = q.from_user
 
-    # ── Main menu items ──────────────────────────────────────────
-    if data == "back_main":
-        await q.message.edit_text(
-            f"سلام <b>{user.first_name}</b>! از منوی زیر انتخاب کن:",
-            reply_markup=main_menu_kb(),
-            parse_mode=ParseMode.HTML,
+    if not is_admin_or_owner(admin.id):
+        await q.answer("⛔ دسترسی ندارید.", show_alert=True)
+        return
+
+    req_id = int(q.data.split("_")[1])
+
+    # Atomically reserve the rejection so no other admin can race
+    with get_db() as con:
+        result = con.execute(
+            "UPDATE point_requests SET status='rejecting', reviewer_id=?, review_at=datetime('now') "
+            "WHERE id=? AND status='pending'",
+            (admin.id, req_id),
         )
+        if result.rowcount == 0:
+            req = con.execute("SELECT status FROM point_requests WHERE id=?", (req_id,)).fetchone()
+            status = req["status"] if req else "unknown"
+            await q.answer(f"این درخواست قبلاً بررسی شده ({status}).", show_alert=True)
+            return
 
-    elif data == "profile":
-        await q.message.edit_text(profile_text(u), reply_markup=back_kb(), parse_mode=ParseMode.HTML)
-
-    elif data == "mypoints":
-        r = rank_info(u["rank_idx"])
-        await q.message.edit_text(
-            f"📊 <b>امتیاز شما</b>\n\n"
-            f"💰 موجودی: <b>{u['points']:,}</b> امتیاز\n"
-            f"🏆 رتبه: {r['name']}\n\n"
-            "برای ارتقا روی ⬆️ ارتقا رتبه بزنید.",
-            reply_markup=back_kb(),
+    # Remove inline buttons, ask admin for rejection reason via next text message
+    try:
+        existing = q.message.caption or ""
+        await q.edit_message_caption(
+            existing + f"\n\n⏳ در انتظار دلیل رد از {admin.first_name}…",
             parse_mode=ParseMode.HTML,
+            reply_markup=None,
         )
+    except Exception:
+        pass
 
-    elif data == "ranks":
-        lines = ["🏆 <b>جدول رتبه‌ها</b>\n"]
-        for i, r in enumerate(RANKS):
-            if r["special"]:
-                lines.append(f"{i+1}. {r['name']} — <i>{r['special']}</i>")
-            elif r["points"] == 0:
-                lines.append(f"{i+1}. {r['name']} — رایگان")
-            else:
-                lines.append(f"{i+1}. {r['name']} — هزینه: <b>{r['points']:,}</b> امتیاز")
-        await q.message.edit_text("\n".join(lines), reply_markup=back_kb(), parse_mode=ParseMode.HTML)
-
-    elif data == "leaderboard":
-        rows = get_leaderboard(10)
-        lines = ["🏅 <b>برترین اعضا</b>\n"]
-        medals = ["🥇", "🥈", "🥉"]
-        for i, row in enumerate(rows):
-            m = medals[i] if i < 3 else f"{i+1}."
-            r = rank_info(row["rank_idx"])
-            lines.append(f"{m} {row['first_name']} — {r['emoji']} {row['points']:,}")
-        await q.message.edit_text("\n".join(lines), reply_markup=back_kb(), parse_mode=ParseMode.HTML)
-
-    elif data == "upgrade":
-        await show_upgrade(update, u, edit=True)
-
-    elif data.startswith("buy_rank_"):
-        next_idx = int(data.split("_")[-1])
-        # Server-side validation — never trust client-sent rank index
-        cur_u = get_user(user.id)  # fresh read
-        if not cur_u:
-            await q.answer("خطا: پروفایل شما یافت نشد.", show_alert=True)
-            return
-        if next_idx != cur_u["rank_idx"] + 1 or next_idx > MAX_PURCHASABLE_RANK:
-            await q.answer("درخواست نامعتبر.", show_alert=True)
-            return
-        r_next = rank_info(next_idx)
-        cost = r_next["points"]
-        # Atomic deduct-and-upgrade: only succeeds when points still sufficient AND rank unchanged
-        with get_db() as con:
-            result = con.execute(
-                """UPDATE users
-                   SET points = points - ?, rank_idx = ?
-                   WHERE user_id = ? AND rank_idx = ? AND points >= ?""",
-                (cost, next_idx, user.id, cur_u["rank_idx"], cost),
-            )
-            rows_changed = result.rowcount
-        if rows_changed == 0:
-            await q.message.edit_text(
-                "❌ ارتقا انجام نشد — امتیاز کافی ندارید یا رتبه تغییر کرده.",
-                reply_markup=back_kb(),
-            )
-            return
-        log.info("Rank upgrade: user_id=%s → rank %s (cost %s pts)", user.id, next_idx, cost)
-        await q.message.edit_text(
-            f"🎉 تبریک! به رتبه {r_next['name']} ارتقا یافتید!\n"
-            f"هزینه: {cost:,} امتیاز کسر شد.",
-            reply_markup=back_kb(),
-            parse_mode=ParseMode.HTML,
-        )
-
-    elif data == "help":
-        await q.message.edit_text(
-            "📖 <b>راهنما</b>\n\n"
-            "• /start — منوی اصلی\n"
-            "• /myinfo — پروفایل\n"
-            "• /ranks — رتبه‌ها\n"
-            "• /leaderboard — برترین‌ها\n"
-            "• /status — وضعیت\n"
-            "• /admin — پنل ادمین\n\n"
-            "برای ارتقا رتبه امتیاز جمع کنید! 🏆",
-            reply_markup=back_kb(),
-            parse_mode=ParseMode.HTML,
-        )
-
-    # ── Admin panel items ─────────────────────────────────────────
-    elif data == "adm_members":
-        if not is_admin_or_owner(user.id):
-            await q.answer("⛔ دسترسی ندارید.", show_alert=True)
-            return
-        rows = get_all_users()
-        lines = [f"👥 <b>اعضا ({len(rows)} نفر)</b>\n"]
-        for row in rows[:20]:
-            r = rank_info(row["rank_idx"])
-            lines.append(f"• {row['first_name']} — {r['emoji']} {row['points']:,} — ID:{row['user_id']}")
-        if len(rows) > 20:
-            lines.append(f"\n... و {len(rows)-20} نفر دیگر")
-        await q.message.edit_text("\n".join(lines), reply_markup=admin_menu_kb(), parse_mode=ParseMode.HTML)
-
-    elif data == "adm_stats":
-        if not is_admin_or_owner(user.id):
-            await q.answer("⛔ دسترسی ندارید.", show_alert=True)
-            return
-        rows = get_all_users()
-        rank_counts = {}
-        for row in rows:
-            rn = RANKS[row["rank_idx"]]["name"]
-            rank_counts[rn] = rank_counts.get(rn, 0) + 1
-        lines = [f"📈 <b>آمار ربات</b>\n\nکل اعضا: <b>{len(rows)}</b>\n\nتوزیع رتبه:"]
-        for rn, cnt in sorted(rank_counts.items(), key=lambda x: -x[1]):
-            lines.append(f"  {rn}: {cnt} نفر")
-        await q.message.edit_text("\n".join(lines), reply_markup=admin_menu_kb(), parse_mode=ParseMode.HTML)
-
-    elif data in ("adm_givepoints", "adm_setadmin", "adm_setvip", "adm_broadcast"):
-        if not is_admin_or_owner(user.id):
-            await q.answer("⛔ دسترسی ندارید.", show_alert=True)
-            return
-        hints = {
-            "adm_givepoints": "برای دادن امتیاز:\n/givepoints [user_id] [مقدار]",
-            "adm_setadmin":   "برای انتصاب ادمین:\n/setadmin [user_id]",
-            "adm_setvip":     "برای تایید VIP:\n/setvip [user_id]",
-            "adm_broadcast":  "برای اطلاع‌رسانی:\n/broadcast [متن]",
-        }
-        await q.message.edit_text(hints[data], reply_markup=admin_menu_kb())
-
-
-# ── Echo unrecognised messages ────────────────────────────────────
-async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    upsert_user(user)
-    await update.message.reply_text(
-        "برای استفاده از ربات /start بزنید. 🤖",
-        reply_markup=main_menu_kb(),
+    # Store req_id so IDLE handler captures the next message as reason
+    ctx.user_data["awaiting_reject_req_id"] = req_id
+    await ctx.bot.send_message(
+        admin.id,
+        f"✏️ دلیل رد درخواست <b>#{req_id}</b> را بنویسید:",
+        parse_mode=ParseMode.HTML,
     )
 
 
-# ─────────────────────────── Bot commands list ───────────────────
-COMMANDS = [
-    BotCommand("start",       "منوی اصلی"),
-    BotCommand("myinfo",      "پروفایل من"),
-    BotCommand("ranks",       "جدول رتبه‌ها"),
-    BotCommand("leaderboard", "برترین اعضا"),
-    BotCommand("status",      "وضعیت ربات"),
-    BotCommand("help",        "راهنما"),
-    BotCommand("admin",       "پنل مدیریت"),
-    BotCommand("setowner",    "انتصاب مالک (یک‌بار)"),
-    BotCommand("givepoints",  "دادن امتیاز [user_id] [مقدار]"),
-    BotCommand("setadmin",    "انتصاب ادمین [user_id]"),
-    BotCommand("removeadmin", "حذف ادمین [user_id]"),
-    BotCommand("setvip",      "تایید VIP [user_id]"),
-    BotCommand("broadcast",   "اطلاع‌رسانی به همه"),
-]
+# ─────────────────────────── Betting flow ────────────────────────
+async def bet_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    username = text.lstrip("@")
+    if not username:
+        await update.message.reply_text("❌ یوزرنیم نامعتبر است. دوباره وارد کنید:")
+        return BET_USERNAME
+
+    opponent = get_user_by_username(username)
+    if not opponent:
+        await update.message.reply_text(
+            f"❌ کاربر @{username} در دیتابیس ربات یافت نشد.\n"
+            "کاربر باید ابتدا /start را زده باشد.",
+            reply_markup=nav_kb(),
+        )
+        return BET_USERNAME
+
+    if opponent["user_id"] == user.id:
+        await update.message.reply_text("❌ نمی‌توانید با خودتان شرط‌بندی کنید.")
+        return BET_USERNAME
+
+    if is_banned(opponent["user_id"]):
+        await update.message.reply_text("❌ این کاربر مسدود شده است.")
+        return BET_USERNAME
+
+    if has_pending_bet(opponent["user_id"]):
+        await update.message.reply_text("❌ این کاربر یک شرط‌بندی فعال دارد.")
+        return BET_USERNAME
+
+    ctx.user_data["bet_opponent_id"] = opponent["user_id"]
+    ctx.user_data["bet_opponent_name"] = opponent["first_name"]
+    ctx.user_data["bet_opponent_username"] = opponent["username"]
+
+    u = get_user(user.id)
+    await update.message.reply_text(
+        f"🎲 حریف: <b>{opponent['first_name']}</b> (@{opponent['username'] or '—'})\n"
+        f"موجودی شما: <b>{u['points']:,}P</b>\n\n"
+        "مقدار شرط (امتیاز) را وارد کنید:",
+        reply_markup=nav_kb(),
+        parse_mode=ParseMode.HTML,
+    )
+    return BET_AMOUNT
 
 
-# ─────────────────────────── Bot runner ─────────────────────────
-_start_time = time.time()
+async def bet_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+
+    if text in (B_BACK, B_HOME):
+        ctx.user_data.pop("bet_opponent_id", None)
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    try:
+        amount = int(text.replace(",", ""))
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ مقدار نامعتبر. یک عدد مثبت وارد کنید:")
+        return BET_AMOUNT
+
+    u = get_user(user.id)
+    if u["points"] < amount:
+        await update.message.reply_text(
+            f"❌ امتیاز کافی ندارید.\nموجودی: {u['points']:,}P  |  شرط: {amount:,}P"
+        )
+        return BET_AMOUNT
+
+    opponent_id = ctx.user_data.get("bet_opponent_id")
+    opponent_u = get_user(opponent_id)
+    if not opponent_u or opponent_u["points"] < amount:
+        await update.message.reply_text(
+            f"❌ حریف امتیاز کافی ندارد (موجودی: {opponent_u['points'] if opponent_u else 0:,}P).",
+            reply_markup=main_menu_kb(user.id),
+        )
+        ctx.user_data.pop("bet_opponent_id", None)
+        return IDLE
+
+    if has_pending_bet(user.id) or has_pending_bet(opponent_id):
+        await update.message.reply_text("❌ یک شرط‌بندی در حال انجام وجود دارد.", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    bet_id = create_bet(user.id, opponent_id, amount)
+
+    # Notify opponent
+    accept_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ قبول", callback_data=f"bet_accept_{bet_id}"),
+        InlineKeyboardButton("❌ رد",   callback_data=f"bet_reject_{bet_id}"),
+    ]])
+    try:
+        await ctx.bot.send_message(
+            opponent_id,
+            f"🎲 <b>درخواست شرط‌بندی!</b>\n\n"
+            f"از طرف: <b>{u['first_name']}</b> (@{u['username'] or '—'})\n"
+            f"مقدار شرط: <b>{amount:,}P</b>\n\n"
+            "قبول می‌کنید؟",
+            reply_markup=accept_kb,
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.warning("Could not send bet request to opponent %s: %s", opponent_id, e)
+        update_bet(bet_id, "cancelled")
+        await update.message.reply_text("❌ نمی‌توان به حریف پیام ارسال کرد.", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    ctx.user_data.pop("bet_opponent_id", None)
+    ctx.user_data.pop("bet_opponent_name", None)
+    ctx.user_data.pop("bet_opponent_username", None)
+
+    await update.message.reply_text(
+        f"✅ درخواست شرط‌بندی ({amount:,}P) ارسال شد. منتظر پاسخ حریف باشید.",
+        reply_markup=main_menu_kb(user.id),
+    )
+    return IDLE
 
 
-async def _post_init(app: Application) -> None:
-    """Called once after Application.initialize() — safe place for async setup."""
-    await app.bot.set_my_commands(COMMANDS)
-    log.info("Bot commands registered in Telegram menu.")
+async def cb_bet_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    bet_id = int(q.data.split("_")[2])
+
+    # Atomic resolution: transition pending→resolved in one transaction with balance recheck
+    winner_id = None
+    loser_id = None
+    amount = None
+    winner_u = None
+    loser_u = None
+
+    with get_db() as con:
+        bet = con.execute("SELECT * FROM bets WHERE id=?", (bet_id,)).fetchone()
+        if not bet or bet["status"] != "pending":
+            await q.edit_message_text("⚠️ این شرط‌بندی دیگر فعال نیست.")
+            return
+        if bet["player_b"] != user.id:
+            await q.answer("این درخواست برای شما نیست.", show_alert=True)
+            return
+
+        amount = bet["amount"]
+        pa = con.execute("SELECT * FROM users WHERE user_id=?", (bet["player_a"],)).fetchone()
+        pb = con.execute("SELECT * FROM users WHERE user_id=?", (bet["player_b"],)).fetchone()
+
+        if not pa or not pb or pa["points"] < amount or pb["points"] < amount:
+            con.execute("UPDATE bets SET status='cancelled' WHERE id=?", (bet_id,))
+            await q.edit_message_text("❌ یکی از بازیکنان امتیاز کافی ندارد. شرط‌بندی لغو شد.")
+            try:
+                await ctx.bot.send_message(bet["player_a"], "❌ شرط‌بندی به دلیل امتیاز ناکافی لغو شد.")
+            except Exception:
+                pass
+            return
+
+        # Determine winner inside the transaction
+        winner_id = random.choice([bet["player_a"], bet["player_b"]])
+        loser_id = bet["player_b"] if winner_id == bet["player_a"] else bet["player_a"]
+
+        con.execute("UPDATE bets SET status='resolved', winner=? WHERE id=? AND status='pending'",
+                    (winner_id, bet_id))
+        con.execute("UPDATE users SET points=points+? WHERE user_id=?", (amount, winner_id))
+        con.execute("UPDATE users SET points=points-? WHERE user_id=?", (amount, loser_id))
+        w_pts_row = con.execute("SELECT points FROM users WHERE user_id=?", (winner_id,)).fetchone()
+        l_pts_row = con.execute("SELECT points FROM users WHERE user_id=?", (loser_id,)).fetchone()
+        w_pts = w_pts_row["points"]
+        l_pts = l_pts_row["points"]
+        winner_u = con.execute("SELECT * FROM users WHERE user_id=?", (winner_id,)).fetchone()
+        loser_u  = con.execute("SELECT * FROM users WHERE user_id=?", (loser_id,)).fetchone()
+
+    result_text = (
+        f"🎲 <b>نتیجه شرط‌بندی #{bet_id}</b>\n\n"
+        f"🏆 برنده: <b>{winner_u['first_name']}</b>  +{amount:,}P  (موجودی: {w_pts:,}P)\n"
+        f"💸 بازنده: <b>{loser_u['first_name']}</b>  -{amount:,}P  (موجودی: {l_pts:,}P)\n\n"
+    )
+
+    # Rematch keyboard
+    rematch_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔄 Rematch", callback_data=f"bet_rematch_{bet_id}"),
+    ]])
+
+    for uid in [bet["player_a"], bet["player_b"]]:
+        try:
+            await ctx.bot.send_message(uid, result_text + "برای بازی مجدد روی Rematch بزنید:",
+                                       reply_markup=rematch_kb, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("Could not send bet result to %s: %s", uid, e)
+
+    await q.edit_message_text("✅ شرط‌بندی پذیرفته شد!", reply_markup=None)
+    log.info("Bet#%s resolved: winner=%s amount=%s", bet_id, winner_id, amount)
 
 
-def run_bot() -> None:
-    """Build and run the bot. PTB v21 run_polling() manages its own event loop."""
+async def cb_bet_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    bet_id = int(q.data.split("_")[2])
+
+    bet = get_bet(bet_id)
+    if not bet or bet["status"] != "pending":
+        await q.edit_message_text("⚠️ این شرط‌بندی دیگر فعال نیست.")
+        return
+    if bet["player_b"] != user.id:
+        await q.answer("این درخواست برای شما نیست.", show_alert=True)
+        return
+
+    update_bet(bet_id, "rejected")
+    await q.edit_message_text("❌ شرط‌بندی رد شد.", reply_markup=None)
+    try:
+        await ctx.bot.send_message(bet["player_a"],
+                                   f"❌ حریف شرط‌بندی #{bet_id} را رد کرد.")
+    except Exception:
+        pass
+
+
+async def cb_bet_rematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    old_bet_id = int(q.data.split("_")[2])
+    old_bet = get_bet(old_bet_id)
+    if not old_bet:
+        await q.answer("شرط‌بندی اصلی یافت نشد.", show_alert=True)
+        return
+
+    amount = old_bet["amount"]
+    # Determine who was the opponent
+    if user.id == old_bet["player_a"]:
+        opponent_id = old_bet["player_b"]
+    elif user.id == old_bet["player_b"]:
+        opponent_id = old_bet["player_a"]
+    else:
+        await q.answer("شما در این شرط‌بندی نبودید.", show_alert=True)
+        return
+
+    u = get_user(user.id)
+    opp = get_user(opponent_id)
+    if not u or not opp:
+        await q.answer("کاربر یافت نشد.", show_alert=True)
+        return
+    if u["points"] < amount or opp["points"] < amount:
+        await q.edit_message_text("❌ یکی از بازیکنان امتیاز کافی برای Rematch ندارد.", reply_markup=None)
+        return
+    if has_pending_bet(user.id) or has_pending_bet(opponent_id):
+        await q.edit_message_text("❌ یک شرط‌بندی فعال وجود دارد.", reply_markup=None)
+        return
+
+    new_bet_id = create_bet(user.id, opponent_id, amount)
+    accept_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ قبول", callback_data=f"bet_accept_{new_bet_id}"),
+        InlineKeyboardButton("❌ رد",   callback_data=f"bet_reject_{new_bet_id}"),
+    ]])
+    try:
+        await ctx.bot.send_message(
+            opponent_id,
+            f"🔄 <b>Rematch از {u['first_name']}!</b>\nمقدار: <b>{amount:,}P</b>",
+            reply_markup=accept_kb, parse_mode=ParseMode.HTML,
+        )
+        await q.edit_message_text("✅ درخواست Rematch ارسال شد.", reply_markup=None)
+    except Exception as e:
+        log.warning("Rematch notify failed: %s", e)
+        update_bet(new_bet_id, "cancelled")
+        await q.edit_message_text("❌ ارسال درخواست Rematch ناموفق بود.", reply_markup=None)
+
+
+# ─────────────────────────── Admin: Add/Remove Admin ─────────────
+async def adm_add_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    target = _resolve_user(text)
+    if not target:
+        await update.message.reply_text("❌ کاربر یافت نشد. User ID یا @username وارد کنید:")
+        return ADM_ADD_ADMIN
+
+    if is_owner(target["user_id"]):
+        await update.message.reply_text("❌ مالک نیاز به ادمین شدن ندارد.", reply_markup=admin_panel_kb())
+        return IDLE
+
+    set_admin(target["user_id"], True)
+    log_admin_action(user.id, "add_admin", target["user_id"])
+    try:
+        await ctx.bot.send_message(target["user_id"], "🛡 شما به عنوان <b>ادمین</b> منصوب شدید!",
+                                   parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"✅ {target['first_name']} (@{target['username'] or '—'}) ادمین شد.",
+        reply_markup=admin_panel_kb(),
+    )
+    return IDLE
+
+
+async def adm_remove_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    target = _resolve_user(text)
+    if not target:
+        await update.message.reply_text("❌ کاربر یافت نشد. User ID یا @username وارد کنید:")
+        return ADM_REMOVE_ADMIN
+
+    set_admin(target["user_id"], False)
+    log_admin_action(user.id, "remove_admin", target["user_id"])
+    try:
+        await ctx.bot.send_message(target["user_id"], "🔔 دسترسی ادمین شما حذف شد.")
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"✅ دسترسی ادمین {target['first_name']} حذف شد.",
+        reply_markup=admin_panel_kb(),
+    )
+    return IDLE
+
+
+# ─────────────────────────── Admin: Broadcast ────────────────────
+async def adm_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    users = get_all_users()
+    sent, failed = 0, 0
+    for u in users:
+        if u["is_banned"]:
+            continue
+        try:
+            await ctx.bot.send_message(u["user_id"],
+                                       f"📢 <b>اطلاعیه Matrix-Family:</b>\n\n{text}",
+                                       parse_mode=ParseMode.HTML)
+            sent += 1
+        except Exception:
+            failed += 1
+
+    log_admin_action(user.id, "broadcast", 0, f"sent={sent}, failed={failed}")
+    await update.message.reply_text(
+        f"✅ Broadcast ارسال شد.\n✉️ موفق: {sent}  |  ❌ ناموفق: {failed}",
+        reply_markup=admin_panel_kb(),
+    )
+    return IDLE
+
+
+# ─────────────────────────── Admin: Set Rank ─────────────────────
+async def adm_set_rank_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    target = _resolve_user(text)
+    if not target:
+        await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
+        return ADM_SET_RANK_USER
+
+    ctx.user_data["adm_target_uid"] = target["user_id"]
+    rank_list = "\n".join(f"{i}. {r}" for i, r in enumerate(RANKS))
+    await update.message.reply_text(
+        f"👤 کاربر: {target['first_name']}\n\nشماره رنک جدید را وارد کنید:\n{rank_list}",
+        reply_markup=nav_kb(),
+    )
+    return ADM_SET_RANK_VALUE
+
+
+async def adm_set_rank_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    try:
+        rank_idx = int(text)
+        if not (0 <= rank_idx < len(RANKS)):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(f"❌ عدد ۰ تا {len(RANKS)-1} وارد کنید:")
+        return ADM_SET_RANK_VALUE
+
+    target_uid = ctx.user_data.pop("adm_target_uid", None)
+    if not target_uid:
+        await update.message.reply_text("❌ خطا. دوباره شروع کنید.", reply_markup=admin_panel_kb())
+        return IDLE
+
+    set_rank(target_uid, rank_idx)
+    log_admin_action(user.id, "set_rank", target_uid, f"rank_idx={rank_idx}")
+    try:
+        await ctx.bot.send_message(target_uid,
+                                   f"🎖 رنک شما به <b>{rank_name(rank_idx)}</b> تغییر کرد.",
+                                   parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"✅ رنک کاربر {target_uid} به {rank_name(rank_idx)} تنظیم شد.",
+        reply_markup=admin_panel_kb(),
+    )
+    return IDLE
+
+
+# ─────────────────────────── Admin: Set Points ───────────────────
+async def adm_set_points_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    target = _resolve_user(text)
+    if not target:
+        await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
+        return ADM_SET_POINTS_USER
+
+    ctx.user_data["adm_target_uid"] = target["user_id"]
+    await update.message.reply_text(
+        f"👤 کاربر: {target['first_name']} (موجودی: {target['points']:,}P)\n\nامتیاز جدید را وارد کنید:",
+        reply_markup=nav_kb(),
+    )
+    return ADM_SET_POINTS_VALUE
+
+
+async def adm_set_points_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    try:
+        points = int(text.replace(",", ""))
+        if points < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ یک عدد مثبت وارد کنید:")
+        return ADM_SET_POINTS_VALUE
+
+    target_uid = ctx.user_data.pop("adm_target_uid", None)
+    if not target_uid:
+        await update.message.reply_text("❌ خطا. دوباره شروع کنید.", reply_markup=admin_panel_kb())
+        return IDLE
+
+    set_points(target_uid, points)
+    log_admin_action(user.id, "set_points", target_uid, f"points={points}")
+    try:
+        await ctx.bot.send_message(target_uid,
+                                   f"⭐ امتیاز شما به <b>{points:,}P</b> تنظیم شد.",
+                                   parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
+    await update.message.reply_text(
+        f"✅ امتیاز کاربر {target_uid} به {points:,}P تنظیم شد.",
+        reply_markup=admin_panel_kb(),
+    )
+    return IDLE
+
+
+# ─────────────────────────── Admin: Ban ──────────────────────────
+async def adm_ban_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    target = _resolve_user(text)
+    if not target:
+        await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
+        return ADM_BAN_USER
+
+    if is_owner(target["user_id"]):
+        await update.message.reply_text("❌ نمی‌توان مالک را بن کرد.", reply_markup=admin_panel_kb())
+        return IDLE
+
+    set_banned(target["user_id"], True)
+    log_admin_action(user.id, "ban", target["user_id"])
+
+    # Notify owner if admin did it
+    if not is_owner(user.id):
+        owner_id = get_owner_id()
+        if owner_id:
+            try:
+                await ctx.bot.send_message(
+                    owner_id,
+                    f"🚫 ادمین {user.first_name} کاربر {target['first_name']} (ID:{target['user_id']}) را بن کرد.",
+                )
+            except Exception:
+                pass
+
+    await update.message.reply_text(
+        f"🚫 کاربر {target['first_name']} (ID:{target['user_id']}) بن شد.",
+        reply_markup=admin_panel_kb(),
+    )
+    return IDLE
+
+
+# ─────────────────────────── Admin: Remove User ──────────────────
+async def adm_remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    if text in (B_BACK, B_HOME):
+        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    target = _resolve_user(text)
+    if not target:
+        await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
+        return ADM_REMOVE_USER
+
+    if is_owner(target["user_id"]):
+        await update.message.reply_text("❌ نمی‌توان مالک را حذف کرد.", reply_markup=admin_panel_kb())
+        return IDLE
+
+    remove_user(target["user_id"])
+    log_admin_action(user.id, "remove_user", target["user_id"])
+
+    if not is_owner(user.id):
+        owner_id = get_owner_id()
+        if owner_id:
+            try:
+                await ctx.bot.send_message(
+                    owner_id,
+                    f"🗑 ادمین {user.first_name} کاربر {target['first_name']} (ID:{target['user_id']}) را حذف کرد.",
+                )
+            except Exception:
+                pass
+
+    await update.message.reply_text(
+        f"✅ کاربر {target['first_name']} (ID:{target['user_id']}) حذف شد.\n"
+        "کاربر می‌تواند با /start بازگردد.",
+        reply_markup=admin_panel_kb(),
+    )
+    return IDLE
+
+
+# ─────────────────────────── Admin: Restore ──────────────────────
+async def adm_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    msg = update.message
+
+    if msg.text and msg.text in (B_BACK, B_HOME):
+        await msg.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        return IDLE
+
+    if not msg.document:
+        await msg.reply_text("⚠️ لطفاً فایل .db ارسال کنید:", reply_markup=nav_kb())
+        return ADM_RESTORE
+
+    doc: Document = msg.document
+    if not doc.file_name.endswith(".db"):
+        await msg.reply_text("❌ فایل باید با پسوند .db باشد.", reply_markup=nav_kb())
+        return ADM_RESTORE
+
+    # Download and replace db
+    try:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        old_backup = BACKUP_DIR / f"pre_restore_{ts}.db"
+        shutil.copy2(DB_PATH, old_backup)  # Backup current db first
+
+        tg_file = await ctx.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(str(DB_PATH))
+        log_admin_action(user.id, "restore", 0, doc.file_name)
+        log.info("Database restored from %s by user %s", doc.file_name, user.id)
+        await msg.reply_text(
+            f"✅ <b>بازیابی موفق!</b>\nدیتابیس از فایل <code>{doc.file_name}</code> بازیابی شد.\n"
+            f"نسخه قبلی در <code>{old_backup.name}</code> ذخیره شد.",
+            reply_markup=admin_panel_kb(),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        log.error("Restore failed: %s", e)
+        await msg.reply_text(f"❌ بازیابی ناموفق: {e}", reply_markup=admin_panel_kb())
+    return IDLE
+
+
+# ─────────────────────────── Resolve user helper ─────────────────
+def _resolve_user(text: str) -> Optional[sqlite3.Row]:
+    """Resolve a User ID or @username string to a user row."""
+    text = text.strip().lstrip("@")
+    if text.isdigit():
+        return get_user(int(text))
+    return get_user_by_username(text)
+
+
+# ─────────────────────────── Fallback / cancel ───────────────────
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "🏠 منوی اصلی", reply_markup=main_menu_kb(update.effective_user.id)
+    )
+    return IDLE
+
+
+# ─────────────────────────── Leaderboard auto-reward ─────────────
+def _leaderboard_reward_loop(app_ref: dict) -> None:
+    """Background thread: every 22 days reward top 3.
+    Uses run_coroutine_threadsafe to schedule notifications on PTB's event loop
+    rather than creating a new loop — avoids cross-thread async conflicts."""
+    CYCLE_DAYS = 22
+    BONUS_POINTS = [300, 200, 100]
+
+    while True:
+        try:
+            last = get_setting("last_leaderboard_cycle")
+            if last:
+                last_dt = datetime.fromisoformat(last)
+                next_dt = last_dt + timedelta(days=CYCLE_DAYS)
+                wait = (next_dt - datetime.now()).total_seconds()
+                if wait > 0:
+                    time.sleep(min(wait, 3600))
+                    continue
+
+            rows = get_leaderboard(3)
+            app: Application = app_ref.get("app")
+            if rows and app:
+                for i, row in enumerate(rows):
+                    pts = BONUS_POINTS[i] if i < len(BONUS_POINTS) else 0
+                    add_points(row["user_id"], pts)
+                    try:
+                        # Schedule notification on PTB's running event loop (thread-safe)
+                        future = asyncio.run_coroutine_threadsafe(
+                            app.bot.send_message(
+                                row["user_id"],
+                                f"🏆 <b>جایزه لیدربرد #{i+1}!</b>\n+{pts:,}P به موجودی شما اضافه شد.",
+                                parse_mode=ParseMode.HTML,
+                            ),
+                            app.bot._loop,  # PTB stores the running loop on the bot
+                        )
+                        future.result(timeout=15)
+                    except Exception as e:
+                        log.warning("Leaderboard reward notify failed for %s: %s", row["user_id"], e)
+
+            set_setting("last_leaderboard_cycle", datetime.now().isoformat())
+            log.info("Leaderboard cycle completed.")
+        except Exception as e:
+            log.error("Leaderboard reward loop error: %s", e)
+        time.sleep(3600)
+
+
+# ─────────────────────────── Bot setup ──────────────────────────
+def build_app() -> Application:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(_post_init)
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(30)
@@ -756,29 +1776,81 @@ def run_bot() -> None:
         .build()
     )
 
-    # Register handlers
-    app.add_handler(CommandHandler("start",        cmd_start))
-    app.add_handler(CommandHandler("setowner",     cmd_setowner))
-    app.add_handler(CommandHandler("admin",        cmd_admin))
-    app.add_handler(CommandHandler("myinfo",       cmd_myinfo))
-    app.add_handler(CommandHandler("ranks",        cmd_ranks))
-    app.add_handler(CommandHandler("leaderboard",  cmd_leaderboard))
-    app.add_handler(CommandHandler("status",       cmd_status))
-    app.add_handler(CommandHandler("help",         cmd_help))
-    app.add_handler(CommandHandler("givepoints",   cmd_givepoints))
-    app.add_handler(CommandHandler("setadmin",     cmd_setadmin))
-    app.add_handler(CommandHandler("removeadmin",  cmd_removeadmin))
-    app.add_handler(CommandHandler("setvip",       cmd_setvip))
-    app.add_handler(CommandHandler("broadcast",    cmd_broadcast))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", cmd_start)],
+        states={
+            IDLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, idle_handler),
+            ],
+            REQ_ACTIVITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, req_activity),
+            ],
+            REQ_PROOF: [
+                MessageHandler(
+                    (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.TEXT)
+                    & ~filters.COMMAND,
+                    req_proof,
+                ),
+            ],
+            BET_USERNAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bet_username),
+            ],
+            BET_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bet_amount),
+            ],
+            ADM_ADD_ADMIN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin),
+            ],
+            ADM_REMOVE_ADMIN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin),
+            ],
+            ADM_BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast),
+            ],
+            ADM_SET_RANK_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_rank_user),
+            ],
+            ADM_SET_RANK_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_rank_value),
+            ],
+            ADM_SET_POINTS_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_points_user),
+            ],
+            ADM_SET_POINTS_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_points_value),
+            ],
+            ADM_BAN_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ban_user),
+            ],
+            ADM_REMOVE_USER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_user),
+            ],
+            ADM_RESTORE: [
+                MessageHandler(
+                    (filters.Document.ALL | filters.TEXT) & ~filters.COMMAND,
+                    adm_restore,
+                ),
+            ],
+        },
+        fallbacks=[CommandHandler("start", cmd_start)],
+        allow_reentry=True,
+        name="main_conv",
+        persistent=False,
+    )
 
-    log.info("Bot is now polling. Ctrl+C to stop.")
-    # run_polling() is synchronous in PTB v21 — it creates and manages its own event loop
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.add_handler(conv)
+
+    # Callback query handlers (outside conversation — work regardless of state)
+    app.add_handler(CallbackQueryHandler(cb_approve, pattern=r"^approve_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_reject,  pattern=r"^reject_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_bet_accept,  pattern=r"^bet_accept_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_bet_reject,  pattern=r"^bet_reject_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_bet_rematch, pattern=r"^bet_rematch_\d+$"))
+
+    return app
 
 
-# ─────────────────────────── Self-healing entry point ────────────
+# ─────────────────────────── Entry point ────────────────────────
 def main() -> None:
     if not BOT_TOKEN:
         log.critical("BOT_TOKEN is not set! Add it to Replit Secrets.")
@@ -787,34 +1859,39 @@ def main() -> None:
     init_db()
     start_keep_alive()
 
-    banner = "Matrix-Family Bot — v3.0 starting"
+    banner = "Matrix-Family Bot v4.0 starting"
     log.info("═" * len(banner))
     log.info(" %s ", banner)
     log.info("═" * len(banner))
 
     consecutive_fails = 0
     MAX_FAILS = 10
-    invalid_token_flag = False
+    app_ref: dict = {}
 
     while True:
-        if invalid_token_flag:
-            log.critical("Invalid token — stopping. Check BOT_TOKEN secret.")
-            sys.exit(1)
-
-        log.info("━━━ Bot start attempt #%d (fails=%d) ━━━",
-                 consecutive_fails + 1, consecutive_fails)
+        log.info("━━━ Bot start attempt #%d (fails=%d) ━━━", consecutive_fails + 1, consecutive_fails)
         try:
-            run_bot()   # PTB v21 run_polling() manages its own event loop
+            app = build_app()
+            app_ref["app"] = app
+
+            # Start leaderboard reward thread once
+            if not app_ref.get("reward_thread_started"):
+                t = threading.Thread(target=_leaderboard_reward_loop, args=(app_ref,), daemon=True)
+                t.start()
+                app_ref["reward_thread_started"] = True
+
+            log.info("Bot is now polling…")
+            app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
             consecutive_fails = 0
 
         except InvalidToken:
-            log.critical("InvalidToken — aborting.")
-            invalid_token_flag = True
+            log.critical("InvalidToken — check BOT_TOKEN secret. Exiting.")
+            sys.exit(1)
 
         except Conflict:
-            log.error("Conflict 409 — another instance is running. Waiting 10s …")
             consecutive_fails += 1
-            time.sleep(10)
+            log.error("Conflict 409 — another instance running. Waiting 15s… (fail #%d)", consecutive_fails)
+            time.sleep(15)
 
         except NetworkError as e:
             consecutive_fails += 1
@@ -829,8 +1906,7 @@ def main() -> None:
         except Exception as e:
             consecutive_fails += 1
             wait = min(5 * consecutive_fails, 120)
-            log.exception("Unhandled exception (fail #%d) — retry in %ds: %s",
-                          consecutive_fails, wait, e)
+            log.exception("Unhandled exception (fail #%d) — retry in %ds: %s", consecutive_fails, wait, e)
             if consecutive_fails >= MAX_FAILS:
                 log.critical("Too many consecutive failures (%d). Exiting.", consecutive_fails)
                 sys.exit(1)
