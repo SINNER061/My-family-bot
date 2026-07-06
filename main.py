@@ -6,7 +6,7 @@ Persian-first · Reply Keyboards · Rank System · Points · Betting · Admin Pa
 from __future__ import annotations
 
 import asyncio
-import io
+import json
 import logging
 import os
 import random
@@ -26,7 +26,6 @@ from telegram import (
     InlineKeyboardMarkup,
     KeyboardButton,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
@@ -39,7 +38,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import Conflict, InvalidToken, NetworkError, TelegramError
+from telegram.error import Conflict, InvalidToken, NetworkError
 
 from keep_alive import start_keep_alive
 
@@ -69,9 +68,9 @@ RANKS = [
     "Lieutenant", "Ranger", "Fusilier", "Gunner", "Marine",
     "Major", "Brigadier", "Staff Leader",
 ]
-# Cost in points to advance TO this rank from the previous one
+# Cost in points to advance TO this rank from the previous one (0 = not purchasable)
 RANK_COSTS = [0, 50, 70, 100, 120, 150, 170, 200, 240, 300, 350, 400, 450, 550, 650, 750, 900, 0]
-MAX_AUTO_RANK = 16   # Brigadier is highest auto-purchasable rank (Staff Leader is manual)
+MAX_AUTO_RANK = 16  # Brigadier is highest auto-purchasable rank; Staff Leader needs manual approval
 RANK_TABLE = (
     "📜 <b>رنک‌های Matrix-Family</b>\n\n"
     "⚔ Members → Bronze        <b>50P</b>\n"
@@ -258,9 +257,7 @@ def get_user(user_id: int) -> Optional[sqlite3.Row]:
 def get_user_by_username(username: str) -> Optional[sqlite3.Row]:
     username = username.lstrip("@").lower()
     with get_db() as con:
-        return con.execute(
-            "SELECT * FROM users WHERE LOWER(username)=?", (username,)
-        ).fetchone()
+        return con.execute("SELECT * FROM users WHERE LOWER(username)=?", (username,)).fetchone()
 
 
 def get_all_users() -> list:
@@ -268,7 +265,7 @@ def get_all_users() -> list:
         return con.execute("SELECT * FROM users ORDER BY joined_at DESC").fetchall()
 
 
-def get_leaderboard(limit: int = 10) -> list:
+def get_leaderboard(limit: int = 20) -> list:
     with get_db() as con:
         return con.execute(
             "SELECT * FROM users WHERE is_banned=0 ORDER BY points DESC, rank_idx DESC LIMIT ?",
@@ -317,16 +314,6 @@ def reset_all_points() -> None:
 def inc_total_requests(user_id: int) -> None:
     with get_db() as con:
         con.execute("UPDATE users SET total_requests=total_requests+1 WHERE user_id=?", (user_id,))
-
-
-def inc_approved(user_id: int) -> None:
-    with get_db() as con:
-        con.execute("UPDATE users SET approved_req=approved_req+1 WHERE user_id=?", (user_id,))
-
-
-def inc_rejected(user_id: int) -> None:
-    with get_db() as con:
-        con.execute("UPDATE users SET rejected_req=rejected_req+1 WHERE user_id=?", (user_id,))
 
 
 # ── Point requests ────────────────────────────────────────────────
@@ -381,6 +368,19 @@ def has_pending_bet(user_id: int) -> bool:
         return row is not None
 
 
+# ── Leaderboard history ───────────────────────────────────────────
+def save_leaderboard_snapshot() -> None:
+    rows = get_leaderboard(10)
+    snapshot = json.dumps([
+        {"user_id": r["user_id"], "first_name": r["first_name"],
+         "rank_idx": r["rank_idx"], "points": r["points"]}
+        for r in rows
+    ], ensure_ascii=False)
+    with get_db() as con:
+        con.execute("INSERT INTO leaderboard_history(cycle_at,snapshot) VALUES(datetime('now'),?)",
+                    (snapshot,))
+
+
 # ── Admin logs ────────────────────────────────────────────────────
 def log_admin_action(admin_id: int, action: str, target_id: int = 0, detail: str = "") -> None:
     with get_db() as con:
@@ -429,7 +429,8 @@ def main_menu_kb(user_id: int) -> ReplyKeyboardMarkup:
 
 
 def nav_kb(extra: list[list[str]] | None = None) -> ReplyKeyboardMarkup:
-    rows = extra or []
+    """Navigation keyboard with optional extra rows. Never mutates the input list."""
+    rows = list(extra) if extra else []   # FIX: copy to avoid mutating caller's list
     rows.append([B_BACK, B_HOME])
     return _kb(rows)
 
@@ -441,6 +442,7 @@ def activity_kb() -> ReplyKeyboardMarkup:
 
 
 def admin_panel_kb() -> ReplyKeyboardMarkup:
+    """Admin panel keyboard — every menu has ⬅️ Back and 🏠 Home per spec."""
     return _kb([
         [B_ADD_ADM, B_REM_ADM],
         [B_BROADCAST, B_STATS],
@@ -448,7 +450,7 @@ def admin_panel_kb() -> ReplyKeyboardMarkup:
         [B_SET_RANK, B_SET_PTS],
         [B_BAN, B_REM_USER],
         [B_RESET_PTS],
-        [B_HOME],
+        [B_BACK, B_HOME],   # FIX: spec requires every menu to have Back + Home
     ])
 
 
@@ -502,41 +504,69 @@ def stats_text() -> str:
     uptime = time.time() - _start_time
     h, rem = divmod(int(uptime), 3600)
     m, s = divmod(rem, 60)
+    with get_db() as con:
+        pending_req = con.execute(
+            "SELECT COUNT(*) as c FROM point_requests WHERE status='pending'"
+        ).fetchone()["c"]
     return (
-        f"📊 <b>Statistics — Matrix-Family Bot</b>\n\n"
+        f"📊 <b>Statistics — Matrix-Family Bot v4.0</b>\n\n"
         f"👥 کل اعضا: <b>{total}</b>\n"
         f"🛡 ادمین‌ها: <b>{admins}</b>\n"
         f"🚫 بن‌شده: <b>{banned}</b>\n"
         f"⭐ کل امتیازها: <b>{total_pts:,}</b>\n"
+        f"📥 درخواست‌های معلق: <b>{pending_req}</b>\n"
         f"⏱ آپتایم: <b>{h:02d}:{m:02d}:{s:02d}</b>"
     )
 
 
-async def notify_admins(app: Application, text: str, reply_markup=None, **kwargs) -> None:
-    """Send a message to all admins and the owner."""
+def _resolve_user(text: str) -> Optional[sqlite3.Row]:
+    """Resolve User ID (numeric) or @username to a user row."""
+    text = text.strip().lstrip("@")
+    if text.isdigit():
+        return get_user(int(text))
+    return get_user_by_username(text)
+
+
+# ── Notification helpers ───────────────────────────────────────────
+async def _notify_owner(bot, text: str) -> None:
+    """Send owner a notification — used for admin action logging."""
     owner_id = get_owner_id()
-    recipients = set()
+    if owner_id:
+        try:
+            await bot.send_message(owner_id, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("Could not notify owner: %s", e)
+
+
+async def _get_admin_recipients() -> list[int]:
+    owner_id = get_owner_id()
+    recipients: set[int] = set()
     if owner_id:
         recipients.add(owner_id)
     with get_db() as con:
         rows = con.execute("SELECT user_id FROM users WHERE is_admin=1").fetchall()
     for r in rows:
         recipients.add(r["user_id"])
-    for uid in recipients:
-        try:
-            await app.bot.send_message(
-                uid, text, reply_markup=reply_markup, parse_mode=ParseMode.HTML, **kwargs
-            )
-        except Exception as e:
-            log.warning("Could not notify admin %s: %s", uid, e)
+    return list(recipients)
+
+
+# ─────────────────────────── Ban guard ──────────────────────────
+async def _ban_guard(update: Update) -> bool:
+    """Returns True if user is banned (caller should abort). Sends notice and ends."""
+    user = update.effective_user
+    if is_banned(user.id):
+        await update.message.reply_text("🚫 حساب شما مسدود شده است.")
+        return True
+    return False
 
 
 # ─────────────────────────── /start ─────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return IDLE
     user = update.effective_user
     upsert_user(user)
 
-    # Ban check
     if is_banned(user.id):
         await update.message.reply_text("🚫 حساب شما مسدود شده است.")
         return ConversationHandler.END
@@ -565,27 +595,32 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 # ─────────────────────────── IDLE dispatcher ─────────────────────
 async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return IDLE
     user = update.effective_user
     text = update.message.text or ""
 
-    # Ban check on every message
-    if is_banned(user.id):
-        await update.message.reply_text("🚫 حساب شما مسدود شده است.")
+    if await _ban_guard(update):
         return ConversationHandler.END
 
     upsert_user(user)
 
-    # ── Check if this admin is waiting to enter rejection reason ──
+    # ── Check if this admin is waiting to enter a rejection reason ──
     if "awaiting_reject_req_id" in ctx.user_data and is_admin_or_owner(user.id):
         req_id = ctx.user_data.pop("awaiting_reject_req_id")
-        reason = text.strip()
+        reason = text.strip() or "—"
         req = get_request(req_id)
         if req and req["status"] == "rejecting":
             update_request(req_id, "rejected", user.id, reason)
-            inc_rejected(req["user_id"])
-            log_admin_action(user.id, "reject_request", req["user_id"], f"req#{req_id}: {reason}")
+            with get_db() as con:
+                con.execute(
+                    "UPDATE users SET rejected_req=rejected_req+1 WHERE user_id=?",
+                    (req["user_id"],)
+                )
+            log_admin_action(user.id, "reject_request", req["user_id"],
+                             f"req#{req_id}: {reason}")
+            act = ACTIVITIES[req["activity_idx"]]
             try:
-                act = ACTIVITIES[req["activity_idx"]]
                 await ctx.bot.send_message(
                     req["user_id"],
                     f"❌ <b>درخواست امتیاز شما رد شد</b>\n\n"
@@ -595,25 +630,32 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 )
             except Exception as e:
                 log.warning("Could not notify user %s of rejection: %s", req["user_id"], e)
+            # Notify owner of admin action (if admin did the rejection)
+            if not is_owner(user.id):
+                u_row = get_user(req["user_id"])
+                name = u_row["first_name"] if u_row else str(req["user_id"])
+                await _notify_owner(
+                    ctx.bot,
+                    f"🛡 ادمین <b>{user.first_name}</b> درخواست #{req_id} کاربر <b>{name}</b> را رد کرد.\n"
+                    f"دلیل: {reason}"
+                )
         await update.message.reply_text(
             "✅ دلیل رد به کاربر ارسال شد.",
             reply_markup=main_menu_kb(user.id),
         )
         return IDLE
 
-    # ── Main menu buttons ──
+    # ── Main menu buttons ──────────────────────────────────────────
     if text == B_PROFILE:
         u = get_user(user.id)
         await update.message.reply_text(
-            profile_text(u),
-            reply_markup=nav_kb(),
-            parse_mode=ParseMode.HTML,
+            profile_text(u), reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
         )
         return IDLE
 
     elif text == B_RANKS:
         await update.message.reply_text(
-            RANK_TABLE, reply_markup=nav_kb(), parse_mode=ParseMode.HTML
+            RANK_TABLE, reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
         )
         return IDLE
 
@@ -630,7 +672,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
                 f"   🎖 {rank_name(r['rank_idx'])}  |  ⭐ {r['points']:,}P"
             )
         await update.message.reply_text(
-            "\n".join(lines), reply_markup=nav_kb(), parse_mode=ParseMode.HTML
+            "\n".join(lines), reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
         )
         return IDLE
 
@@ -640,13 +682,14 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             "<b>هدف:</b>\n"
             "این ربات سیستم امتیاز و رتبه‌بندی خانواده Matrix را مدیریت می‌کند.\n\n"
             "<b>سیستم امتیاز:</b>\n"
-            "با انجام فعالیت‌های مختلف امتیاز کسب کنید. درخواست ارسال کنید، ادمین تایید می‌کند، امتیاز دریافت می‌کنید.\n\n"
+            "با انجام فعالیت‌های مختلف امتیاز کسب کنید. درخواست ارسال کنید، "
+            "ادمین تایید می‌کند، امتیاز دریافت می‌کنید.\n\n"
             "<b>سیستم رنک:</b>\n"
-            "با امتیاز کافی رنک خود را ارتقا دهید. از Members تا Staff Leader.\n\n"
+            "با امتیاز کافی رنک خود را ارتقا دهید — از Members تا Staff Leader.\n\n"
             "<b>شرط‌بندی:</b>\n"
             "با اعضای دیگر شرط ببندید. برنده امتیاز می‌گیرد، بازنده کم می‌کند.\n\n"
             "<b>لیدربرد:</b>\n"
-            "هر ۲۲ روز یک‌بار ۳ نفر برتر جایزه می‌گیرند.\n\n"
+            "هر ۲۲ روز یک‌بار ۳ نفر برتر جایزه می‌گیرند (300/200/100 امتیاز).\n\n"
             "👨‍💻 <b>Developer:</b> سپهر (ماتریکس) — @oovqx",
             reply_markup=nav_kb(),
             parse_mode=ParseMode.HTML,
@@ -667,7 +710,8 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
         if cur_idx >= MAX_AUTO_RANK:
             await update.message.reply_text(
-                f"🎖 رنک فعلی: <b>{rn}</b>\nارتقا به Staff Leader نیاز به تایید مالک دارد.",
+                f"🎖 رنک فعلی: <b>{rn}</b>\n"
+                "ارتقا به Staff Leader نیاز به تایید مالک دارد.",
                 reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
             )
             return IDLE
@@ -677,7 +721,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         balance = u["points"]
         can = balance >= cost
 
-        text_body = (
+        info = (
             f"🎖 <b>ارتقای رنک</b>\n\n"
             f"رنک فعلی: <b>{rn}</b>\n"
             f"رنک بعدی: <b>{rank_name(next_idx)}</b>\n"
@@ -686,7 +730,6 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         )
 
         if can:
-            # Do the upgrade
             with get_db() as con:
                 result = con.execute(
                     "UPDATE users SET points=points-?,rank_idx=? "
@@ -696,18 +739,18 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             if result.rowcount:
                 log.info("Rank upgrade: user=%s → %s (cost %sP)", user.id, next_idx, cost)
                 await update.message.reply_text(
-                    text_body + f"🎉 <b>تبریک! به رنک {rank_name(next_idx)} ارتقا یافتید!</b>\n"
+                    info + f"🎉 <b>تبریک! به رنک {rank_name(next_idx)} ارتقا یافتید!</b>\n"
                     f"{cost:,}P از موجودی شما کسر شد.",
                     reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
                 )
             else:
                 await update.message.reply_text(
-                    text_body + "❌ ارتقا انجام نشد — وضعیت تغییر کرده، دوباره تلاش کنید.",
+                    info + "❌ ارتقا انجام نشد — وضعیت تغییر کرده، دوباره تلاش کنید.",
                     reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
                 )
         else:
             await update.message.reply_text(
-                text_body + f"❌ امتیاز کافی ندارید. {cost - balance:,}P بیشتر نیاز دارید.",
+                info + f"❌ امتیاز کافی ندارید. {cost - balance:,}P بیشتر نیاز دارید.",
                 reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
             )
         return IDLE
@@ -722,7 +765,6 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return REQ_ACTIVITY
 
     elif text == B_BET:
-        u = get_user(user.id)
         if has_pending_bet(user.id):
             await update.message.reply_text(
                 "⚠️ شما یک شرط‌بندی فعال دارید. ابتدا آن را تمام کنید.",
@@ -730,24 +772,26 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             )
             return IDLE
         await update.message.reply_text(
-            "🎲 <b>شرط‌بندی</b>\n\nیوزرنیم حریف را وارد کنید (بدون @):",
+            "🎲 <b>شرط‌بندی</b>\n\nیوزرنیم حریف را وارد کنید (مثال: username یا @username):",
             reply_markup=nav_kb(),
             parse_mode=ParseMode.HTML,
         )
         return BET_USERNAME
 
+    # ── Admin panel entry ──────────────────────────────────────────
     elif text == B_ADMIN:
         if not is_admin_or_owner(user.id):
             await update.message.reply_text("⛔ دسترسی ندارید.")
             return IDLE
+        badge = "👑 مالک" if is_owner(user.id) else "🛡 ادمین"
         await update.message.reply_text(
-            "⚙️ <b>پنل مدیریت — Matrix-Family</b>\n\nگزینه‌ای انتخاب کنید:",
+            f"⚙️ <b>پنل مدیریت — Matrix-Family</b>\n<i>{badge}</i>\n\nگزینه‌ای انتخاب کنید:",
             reply_markup=admin_panel_kb(),
             parse_mode=ParseMode.HTML,
         )
         return IDLE
 
-    # ── Admin panel buttons ──
+    # ── Admin panel buttons ────────────────────────────────────────
     elif text == B_ADD_ADM:
         if not is_owner(user.id):
             await update.message.reply_text("⛔ فقط مالک می‌تواند ادمین اضافه کند.")
@@ -760,7 +804,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     elif text == B_REM_ADM:
         if not is_owner(user.id):
-            await update.message.reply_text("⛔ دسترسی ندارید.")
+            await update.message.reply_text("⛔ فقط مالک می‌تواند ادمین حذف کند.")
             return IDLE
         await update.message.reply_text(
             "➖ <b>Remove Admin</b>\n\nUser ID یا یوزرنیم ادمین را وارد کنید:",
@@ -783,7 +827,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text("⛔ دسترسی ندارید.")
             return IDLE
         await update.message.reply_text(
-            stats_text(), reply_markup=admin_panel_kb(), parse_mode=ParseMode.HTML
+            stats_text(), reply_markup=admin_panel_kb(), parse_mode=ParseMode.HTML,
         )
         return IDLE
 
@@ -795,8 +839,10 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         backup_path = BACKUP_DIR / f"family_{ts}.db"
         shutil.copy2(DB_PATH, backup_path)
         log_admin_action(user.id, "backup", 0, str(backup_path))
-        log.info("Backup created: %s", backup_path)
-        await update.message.reply_text("💾 در حال ارسال فایل پشتیبان…", reply_markup=admin_panel_kb())
+        log.info("Backup created: %s by user %s", backup_path, user.id)
+        await update.message.reply_text(
+            "💾 در حال ارسال فایل پشتیبان…", reply_markup=admin_panel_kb()
+        )
         with open(backup_path, "rb") as f:
             await ctx.bot.send_document(
                 user.id, f,
@@ -823,7 +869,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text("⛔ دسترسی ندارید.")
             return IDLE
         await update.message.reply_text(
-            "👤 <b>Set User Rank</b>\n\nUser ID کاربر را وارد کنید:",
+            "👤 <b>Set User Rank</b>\n\nUser ID یا یوزرنیم کاربر را وارد کنید:",
             reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
         )
         return ADM_SET_RANK_USER
@@ -833,7 +879,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text("⛔ دسترسی ندارید.")
             return IDLE
         await update.message.reply_text(
-            "⭐ <b>Set User Points</b>\n\nUser ID کاربر را وارد کنید:",
+            "⭐ <b>Set User Points</b>\n\nUser ID یا یوزرنیم کاربر را وارد کنید:",
             reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
         )
         return ADM_SET_POINTS_USER
@@ -843,7 +889,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text("⛔ دسترسی ندارید.")
             return IDLE
         await update.message.reply_text(
-            "🚫 <b>Ban User</b>\n\nUser ID کاربر را وارد کنید:",
+            "🚫 <b>Ban User</b>\n\nUser ID یا یوزرنیم کاربر را وارد کنید:",
             reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
         )
         return ADM_BAN_USER
@@ -853,7 +899,7 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             await update.message.reply_text("⛔ دسترسی ندارید.")
             return IDLE
         await update.message.reply_text(
-            "🗑 <b>Remove User</b>\n\nUser ID کاربر را وارد کنید:",
+            "🗑 <b>Remove User</b>\n\nUser ID یا یوزرنیم کاربر را وارد کنید:",
             reply_markup=nav_kb(), parse_mode=ParseMode.HTML,
         )
         return ADM_REMOVE_USER
@@ -862,39 +908,67 @@ async def idle_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         if not is_owner(user.id):
             await update.message.reply_text("⛔ فقط مالک می‌تواند این کار را انجام دهد.")
             return IDLE
-        reset_all_points()
-        log_admin_action(user.id, "reset_all_points")
+        # FIX: Confirmation step via inline keyboard before destructive action
+        confirm_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("⚠️ بله، ریست کن", callback_data="reset_pts_confirm"),
+            InlineKeyboardButton("❌ لغو",           callback_data="reset_pts_cancel"),
+        ]])
         await update.message.reply_text(
-            "🔄 امتیاز همه اعضا صفر شد.",
-            reply_markup=admin_panel_kb(),
+            "⚠️ <b>هشدار!</b>\n\n"
+            "این عمل امتیاز <b>همه اعضا</b> را صفر می‌کند و قابل بازگشت نیست.\n\n"
+            "آیا مطمئن هستید؟",
+            reply_markup=confirm_kb,
+            parse_mode=ParseMode.HTML,
         )
         return IDLE
 
     elif text in (B_BACK, B_HOME):
         await update.message.reply_text(
-            "🏠 منوی اصلی",
-            reply_markup=main_menu_kb(user.id),
+            "🏠 منوی اصلی", reply_markup=main_menu_kb(user.id),
         )
         return IDLE
 
     else:
         await update.message.reply_text(
-            "❓ گزینه‌ای انتخاب نشد. از منوی زیر استفاده کنید:",
+            "❓ گزینه شناخته نشد. از منوی زیر استفاده کنید:",
             reply_markup=main_menu_kb(user.id),
         )
         return IDLE
 
 
+# ─────────────────────────── Reset Points callbacks ──────────────
+async def cb_reset_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    user = q.from_user
+    if not is_owner(user.id):
+        await q.answer("⛔ فقط مالک می‌تواند.", show_alert=True)
+        return
+    reset_all_points()
+    log_admin_action(user.id, "reset_all_points")
+    log.info("All points reset by owner %s", user.id)
+    await q.edit_message_text("🔄 <b>امتیاز همه اعضا صفر شد.</b>", parse_mode=ParseMode.HTML)
+
+
+async def cb_reset_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("❌ عملیات ریست لغو شد.")
+
+
 # ─────────────────────────── Point request flow ──────────────────
 async def req_activity(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return REQ_ACTIVITY
     user = update.effective_user
+    if await _ban_guard(update):
+        return ConversationHandler.END
     text = update.message.text or ""
 
     if text in (B_BACK, B_HOME):
         await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
         return IDLE
 
-    # Match activity
     act_idx = next((i for i, a in enumerate(ACTIVITIES) if a["name"] == text), None)
     if act_idx is None:
         await update.message.reply_text(
@@ -917,14 +991,20 @@ async def req_activity(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def req_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return REQ_PROOF
     user = update.effective_user
+    # FIX: Ban check in sub-state — user could be banned while mid-upload
+    if await _ban_guard(update):
+        return ConversationHandler.END
+
     msg = update.message
 
     if msg.text and msg.text in (B_BACK, B_HOME):
+        ctx.user_data.pop("req_activity_idx", None)
         await msg.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
         return IDLE
 
-    # Determine file type and ID
     file_id = None
     file_type = None
     if msg.photo:
@@ -939,25 +1019,21 @@ async def req_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
     if not file_id:
         await msg.reply_text(
-            "⚠️ لطفاً یک عکس، ویدیو یا فایل ارسال کنید:",
-            reply_markup=nav_kb(),
+            "⚠️ لطفاً یک عکس، ویدیو یا فایل ارسال کنید:", reply_markup=nav_kb(),
         )
         return REQ_PROOF
 
-    act_idx = ctx.user_data.get("req_activity_idx", 0)
+    act_idx = ctx.user_data.pop("req_activity_idx", 0)
     req_id = create_request(user.id, act_idx, file_id, file_type)
     inc_total_requests(user.id)
 
     u = get_user(user.id)
     act = ACTIVITIES[act_idx]
 
-    # Notify admins + owner
-    approve_kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ تایید", callback_data=f"approve_{req_id}"),
-            InlineKeyboardButton("❌ رد", callback_data=f"reject_{req_id}"),
-        ]
-    ])
+    approve_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تایید", callback_data=f"approve_{req_id}"),
+        InlineKeyboardButton("❌ رد",   callback_data=f"reject_{req_id}"),
+    ]])
     notice = (
         f"📥 <b>درخواست امتیاز جدید #{req_id}</b>\n\n"
         f"👤 کاربر: {u['first_name']} (@{u['username'] or '—'})\n"
@@ -967,18 +1043,8 @@ async def req_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         + (f"\n🎖 بونوس رنک: +{act['bonus_ranks']}" if act["bonus_ranks"] else "")
     )
 
-    owner_id = get_owner_id()
-    recipients = set()
-    if owner_id:
-        recipients.add(owner_id)
-    with get_db() as con:
-        rows = con.execute("SELECT user_id FROM users WHERE is_admin=1").fetchall()
-    for r in rows:
-        recipients.add(r["user_id"])
-
-    for uid in recipients:
+    for uid in await _get_admin_recipients():
         try:
-            # Send the proof file first, then the notice with buttons
             if file_type == "photo":
                 await ctx.bot.send_photo(uid, file_id, caption=notice,
                                          parse_mode=ParseMode.HTML, reply_markup=approve_kb)
@@ -999,7 +1065,6 @@ async def req_proof(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=main_menu_kb(user.id),
         parse_mode=ParseMode.HTML,
     )
-    ctx.user_data.pop("req_activity_idx", None)
     return IDLE
 
 
@@ -1015,7 +1080,7 @@ async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     req_id = int(q.data.split("_")[1])
 
-    # Atomic status transition — only one admin wins the race
+    # Atomic transition: only first admin wins
     with get_db() as con:
         result = con.execute(
             "UPDATE point_requests SET status='approved', reviewer_id=?, review_at=datetime('now') "
@@ -1023,7 +1088,6 @@ async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             (admin.id, req_id),
         )
         if result.rowcount == 0:
-            # Already reviewed by another admin
             req = con.execute("SELECT status FROM point_requests WHERE id=?", (req_id,)).fetchone()
             status = req["status"] if req else "unknown"
             await q.answer(f"این درخواست قبلاً بررسی شده ({status}).", show_alert=True)
@@ -1034,35 +1098,49 @@ async def cb_approve(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer("کاربر یافت نشد.", show_alert=True)
             return
         act = ACTIVITIES[req["activity_idx"]]
-        # Apply points and bonus ranks in same transaction
-        con.execute("UPDATE users SET points=points+?, approved_req=approved_req+1 WHERE user_id=?",
-                    (act["points"], req["user_id"]))
-        new_pts = con.execute("SELECT points FROM users WHERE user_id=?", (req["user_id"],)).fetchone()["points"]
+        con.execute(
+            "UPDATE users SET points=points+?, approved_req=approved_req+1 WHERE user_id=?",
+            (act["points"], req["user_id"])
+        )
+        new_pts = con.execute(
+            "SELECT points FROM users WHERE user_id=?", (req["user_id"],)
+        ).fetchone()["points"]
         new_rank_idx = u["rank_idx"]
         if act["bonus_ranks"] > 0:
             new_rank_idx = min(u["rank_idx"] + act["bonus_ranks"], len(RANKS) - 1)
-            con.execute("UPDATE users SET rank_idx=? WHERE user_id=?", (new_rank_idx, req["user_id"]))
+            con.execute("UPDATE users SET rank_idx=? WHERE user_id=?",
+                        (new_rank_idx, req["user_id"]))
 
     log_admin_action(admin.id, "approve_request", req["user_id"],
                      f"req#{req_id} +{act['points']}P +{act['bonus_ranks']}rank")
-    log.info("Approved req#%s for user %s: +%sP +%srank", req_id, req["user_id"],
-             act["points"], act["bonus_ranks"])
+    log.info("Approved req#%s for user %s: +%sP +%srank",
+             req_id, req["user_id"], act["points"], act["bonus_ranks"])
 
     # Notify user
     try:
-        msg = (
+        notif = (
             f"✅ <b>درخواست امتیاز شما تایید شد!</b>\n\n"
             f"فعالیت: {act['name']}\n"
             f"⭐ امتیاز دریافتی: <b>+{act['points']}P</b>\n"
             f"💰 موجودی جدید: <b>{new_pts:,}P</b>"
         )
         if act["bonus_ranks"]:
-            msg += f"\n🎖 رنک جدید: <b>{rank_name(new_rank_idx)}</b>"
-        await ctx.bot.send_message(req["user_id"], msg, parse_mode=ParseMode.HTML)
+            notif += f"\n🎖 رنک جدید: <b>{rank_name(new_rank_idx)}</b>"
+        await ctx.bot.send_message(req["user_id"], notif, parse_mode=ParseMode.HTML)
     except Exception as e:
         log.warning("Could not notify user %s of approval: %s", req["user_id"], e)
 
-    # Edit admin message
+    # Notify owner if an admin (not owner) did this
+    if not is_owner(admin.id):
+        u_row = get_user(req["user_id"])
+        name = u_row["first_name"] if u_row else str(req["user_id"])
+        await _notify_owner(
+            ctx.bot,
+            f"🛡 ادمین <b>{admin.first_name}</b> درخواست #{req_id} کاربر <b>{name}</b> را تایید کرد.\n"
+            f"فعالیت: {act['name']} | +{act['points']}P"
+        )
+
+    # Update admin message caption
     try:
         existing = q.message.caption or ""
         await q.edit_message_caption(
@@ -1098,7 +1176,6 @@ async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await q.answer(f"این درخواست قبلاً بررسی شده ({status}).", show_alert=True)
             return
 
-    # Remove inline buttons, ask admin for rejection reason via next text message
     try:
         existing = q.message.caption or ""
         await q.edit_message_caption(
@@ -1109,7 +1186,6 @@ async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         pass
 
-    # Store req_id so IDLE handler captures the next message as reason
     ctx.user_data["awaiting_reject_req_id"] = req_id
     await ctx.bot.send_message(
         admin.id,
@@ -1120,7 +1196,11 @@ async def cb_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ─────────────────────────── Betting flow ────────────────────────
 async def bet_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return BET_USERNAME
     user = update.effective_user
+    if await _ban_guard(update):
+        return ConversationHandler.END
     text = (update.message.text or "").strip()
 
     if text in (B_BACK, B_HOME):
@@ -1154,9 +1234,6 @@ async def bet_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return BET_USERNAME
 
     ctx.user_data["bet_opponent_id"] = opponent["user_id"]
-    ctx.user_data["bet_opponent_name"] = opponent["first_name"]
-    ctx.user_data["bet_opponent_username"] = opponent["username"]
-
     u = get_user(user.id)
     await update.message.reply_text(
         f"🎲 حریف: <b>{opponent['first_name']}</b> (@{opponent['username'] or '—'})\n"
@@ -1169,7 +1246,11 @@ async def bet_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def bet_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not update.message:
+        return BET_AMOUNT
     user = update.effective_user
+    if await _ban_guard(update):
+        return ConversationHandler.END
     text = (update.message.text or "").strip()
 
     if text in (B_BACK, B_HOME):
@@ -1193,6 +1274,11 @@ async def bet_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return BET_AMOUNT
 
     opponent_id = ctx.user_data.get("bet_opponent_id")
+    if not opponent_id:
+        await update.message.reply_text("❌ خطا. دوباره از شرط‌بندی شروع کنید.",
+                                        reply_markup=main_menu_kb(user.id))
+        return IDLE
+
     opponent_u = get_user(opponent_id)
     if not opponent_u or opponent_u["points"] < amount:
         await update.message.reply_text(
@@ -1203,12 +1289,13 @@ async def bet_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         return IDLE
 
     if has_pending_bet(user.id) or has_pending_bet(opponent_id):
-        await update.message.reply_text("❌ یک شرط‌بندی در حال انجام وجود دارد.", reply_markup=main_menu_kb(user.id))
+        await update.message.reply_text(
+            "❌ یک شرط‌بندی در حال انجام وجود دارد.",
+            reply_markup=main_menu_kb(user.id)
+        )
         return IDLE
 
     bet_id = create_bet(user.id, opponent_id, amount)
-
-    # Notify opponent
     accept_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ قبول", callback_data=f"bet_accept_{bet_id}"),
         InlineKeyboardButton("❌ رد",   callback_data=f"bet_reject_{bet_id}"),
@@ -1226,13 +1313,13 @@ async def bet_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     except Exception as e:
         log.warning("Could not send bet request to opponent %s: %s", opponent_id, e)
         update_bet(bet_id, "cancelled")
-        await update.message.reply_text("❌ نمی‌توان به حریف پیام ارسال کرد.", reply_markup=main_menu_kb(user.id))
+        await update.message.reply_text(
+            "❌ نمی‌توان به حریف پیام ارسال کرد.", reply_markup=main_menu_kb(user.id)
+        )
+        ctx.user_data.pop("bet_opponent_id", None)
         return IDLE
 
     ctx.user_data.pop("bet_opponent_id", None)
-    ctx.user_data.pop("bet_opponent_name", None)
-    ctx.user_data.pop("bet_opponent_username", None)
-
     await update.message.reply_text(
         f"✅ درخواست شرط‌بندی ({amount:,}P) ارسال شد. منتظر پاسخ حریف باشید.",
         reply_markup=main_menu_kb(user.id),
@@ -1245,13 +1332,6 @@ async def cb_bet_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await q.answer()
     user = q.from_user
     bet_id = int(q.data.split("_")[2])
-
-    # Atomic resolution: transition pending→resolved in one transaction with balance recheck
-    winner_id = None
-    loser_id = None
-    amount = None
-    winner_u = None
-    loser_u = None
 
     with get_db() as con:
         bet = con.execute("SELECT * FROM bets WHERE id=?", (bet_id,)).fetchone()
@@ -1270,12 +1350,13 @@ async def cb_bet_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             con.execute("UPDATE bets SET status='cancelled' WHERE id=?", (bet_id,))
             await q.edit_message_text("❌ یکی از بازیکنان امتیاز کافی ندارد. شرط‌بندی لغو شد.")
             try:
-                await ctx.bot.send_message(bet["player_a"], "❌ شرط‌بندی به دلیل امتیاز ناکافی لغو شد.")
+                await ctx.bot.send_message(bet["player_a"],
+                                           "❌ شرط‌بندی به دلیل امتیاز ناکافی لغو شد.")
             except Exception:
                 pass
             return
 
-        # Determine winner inside the transaction
+        # Atomic: pick winner + settle in one transaction
         winner_id = random.choice([bet["player_a"], bet["player_b"]])
         loser_id = bet["player_b"] if winner_id == bet["player_a"] else bet["player_a"]
 
@@ -1283,10 +1364,10 @@ async def cb_bet_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     (winner_id, bet_id))
         con.execute("UPDATE users SET points=points+? WHERE user_id=?", (amount, winner_id))
         con.execute("UPDATE users SET points=points-? WHERE user_id=?", (amount, loser_id))
-        w_pts_row = con.execute("SELECT points FROM users WHERE user_id=?", (winner_id,)).fetchone()
-        l_pts_row = con.execute("SELECT points FROM users WHERE user_id=?", (loser_id,)).fetchone()
-        w_pts = w_pts_row["points"]
-        l_pts = l_pts_row["points"]
+        w_pts = con.execute("SELECT points FROM users WHERE user_id=?",
+                            (winner_id,)).fetchone()["points"]
+        l_pts = con.execute("SELECT points FROM users WHERE user_id=?",
+                            (loser_id,)).fetchone()["points"]
         winner_u = con.execute("SELECT * FROM users WHERE user_id=?", (winner_id,)).fetchone()
         loser_u  = con.execute("SELECT * FROM users WHERE user_id=?", (loser_id,)).fetchone()
 
@@ -1295,16 +1376,16 @@ async def cb_bet_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"🏆 برنده: <b>{winner_u['first_name']}</b>  +{amount:,}P  (موجودی: {w_pts:,}P)\n"
         f"💸 بازنده: <b>{loser_u['first_name']}</b>  -{amount:,}P  (موجودی: {l_pts:,}P)\n\n"
     )
-
-    # Rematch keyboard
     rematch_kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Rematch", callback_data=f"bet_rematch_{bet_id}"),
     ]])
 
     for uid in [bet["player_a"], bet["player_b"]]:
         try:
-            await ctx.bot.send_message(uid, result_text + "برای بازی مجدد روی Rematch بزنید:",
-                                       reply_markup=rematch_kb, parse_mode=ParseMode.HTML)
+            await ctx.bot.send_message(
+                uid, result_text + "برای بازی مجدد روی Rematch بزنید:",
+                reply_markup=rematch_kb, parse_mode=ParseMode.HTML,
+            )
         except Exception as e:
             log.warning("Could not send bet result to %s: %s", uid, e)
 
@@ -1346,7 +1427,6 @@ async def cb_bet_rematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     amount = old_bet["amount"]
-    # Determine who was the opponent
     if user.id == old_bet["player_a"]:
         opponent_id = old_bet["player_b"]
     elif user.id == old_bet["player_b"]:
@@ -1361,7 +1441,9 @@ async def cb_bet_rematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await q.answer("کاربر یافت نشد.", show_alert=True)
         return
     if u["points"] < amount or opp["points"] < amount:
-        await q.edit_message_text("❌ یکی از بازیکنان امتیاز کافی برای Rematch ندارد.", reply_markup=None)
+        await q.edit_message_text(
+            "❌ یکی از بازیکنان امتیاز کافی برای Rematch ندارد.", reply_markup=None
+        )
         return
     if has_pending_bet(user.id) or has_pending_bet(opponent_id):
         await q.edit_message_text("❌ یک شرط‌بندی فعال وجود دارد.", reply_markup=None)
@@ -1385,27 +1467,32 @@ async def cb_bet_rematch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await q.edit_message_text("❌ ارسال درخواست Rematch ناموفق بود.", reply_markup=None)
 
 
-# ─────────────────────────── Admin: Add/Remove Admin ─────────────
+# ─────────────────────────── Admin flows ─────────────────────────
+def _admin_back(text: str) -> bool:
+    return text in (B_BACK, B_HOME)
+
+
 async def adm_add_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        await update.message.reply_text(
+            "⚙️ پنل مدیریت", reply_markup=admin_panel_kb()
+        )
         return IDLE
-
     target = _resolve_user(text)
     if not target:
         await update.message.reply_text("❌ کاربر یافت نشد. User ID یا @username وارد کنید:")
         return ADM_ADD_ADMIN
-
     if is_owner(target["user_id"]):
-        await update.message.reply_text("❌ مالک نیاز به ادمین شدن ندارد.", reply_markup=admin_panel_kb())
+        await update.message.reply_text("❌ مالک نیاز به ادمین شدن ندارد.",
+                                        reply_markup=admin_panel_kb())
         return IDLE
-
     set_admin(target["user_id"], True)
     log_admin_action(user.id, "add_admin", target["user_id"])
     try:
-        await ctx.bot.send_message(target["user_id"], "🛡 شما به عنوان <b>ادمین</b> منصوب شدید!",
+        await ctx.bot.send_message(target["user_id"],
+                                   "🛡 شما به عنوان <b>ادمین</b> منصوب شدید!",
                                    parse_mode=ParseMode.HTML)
     except Exception:
         pass
@@ -1419,15 +1506,13 @@ async def adm_add_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
 async def adm_remove_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     target = _resolve_user(text)
     if not target:
         await update.message.reply_text("❌ کاربر یافت نشد. User ID یا @username وارد کنید:")
         return ADM_REMOVE_ADMIN
-
     set_admin(target["user_id"], False)
     log_admin_action(user.id, "remove_admin", target["user_id"])
     try:
@@ -1441,28 +1526,34 @@ async def adm_remove_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> in
     return IDLE
 
 
-# ─────────────────────────── Admin: Broadcast ────────────────────
 async def adm_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     users = get_all_users()
     sent, failed = 0, 0
     for u in users:
         if u["is_banned"]:
             continue
         try:
-            await ctx.bot.send_message(u["user_id"],
-                                       f"📢 <b>اطلاعیه Matrix-Family:</b>\n\n{text}",
-                                       parse_mode=ParseMode.HTML)
+            await ctx.bot.send_message(
+                u["user_id"],
+                f"📢 <b>اطلاعیه Matrix-Family:</b>\n\n{text}",
+                parse_mode=ParseMode.HTML,
+            )
             sent += 1
         except Exception:
             failed += 1
-
     log_admin_action(user.id, "broadcast", 0, f"sent={sent}, failed={failed}")
+    # Notify owner if admin broadcast
+    if not is_owner(user.id):
+        await _notify_owner(
+            ctx.bot,
+            f"📢 ادمین <b>{user.first_name}</b> یک Broadcast ارسال کرد.\n"
+            f"✉️ موفق: {sent} | ❌ ناموفق: {failed}"
+        )
     await update.message.reply_text(
         f"✅ Broadcast ارسال شد.\n✉️ موفق: {sent}  |  ❌ ناموفق: {failed}",
         reply_markup=admin_panel_kb(),
@@ -1470,24 +1561,23 @@ async def adm_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return IDLE
 
 
-# ─────────────────────────── Admin: Set Rank ─────────────────────
 async def adm_set_rank_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     target = _resolve_user(text)
     if not target:
         await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
         return ADM_SET_RANK_USER
-
     ctx.user_data["adm_target_uid"] = target["user_id"]
     rank_list = "\n".join(f"{i}. {r}" for i, r in enumerate(RANKS))
     await update.message.reply_text(
-        f"👤 کاربر: {target['first_name']}\n\nشماره رنک جدید را وارد کنید:\n{rank_list}",
+        f"👤 کاربر: <b>{target['first_name']}</b> (رنک فعلی: {rank_name(target['rank_idx'])})\n\n"
+        f"شماره رنک جدید (۰–{len(RANKS)-1}):\n{rank_list}",
         reply_markup=nav_kb(),
+        parse_mode=ParseMode.HTML,
     )
     return ADM_SET_RANK_VALUE
 
@@ -1495,10 +1585,10 @@ async def adm_set_rank_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> i
 async def adm_set_rank_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        ctx.user_data.pop("adm_target_uid", None)
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     try:
         rank_idx = int(text)
         if not (0 <= rank_idx < len(RANKS)):
@@ -1506,12 +1596,10 @@ async def adm_set_rank_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     except ValueError:
         await update.message.reply_text(f"❌ عدد ۰ تا {len(RANKS)-1} وارد کنید:")
         return ADM_SET_RANK_VALUE
-
     target_uid = ctx.user_data.pop("adm_target_uid", None)
     if not target_uid:
         await update.message.reply_text("❌ خطا. دوباره شروع کنید.", reply_markup=admin_panel_kb())
         return IDLE
-
     set_rank(target_uid, rank_idx)
     log_admin_action(user.id, "set_rank", target_uid, f"rank_idx={rank_idx}")
     try:
@@ -1527,23 +1615,22 @@ async def adm_set_rank_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> 
     return IDLE
 
 
-# ─────────────────────────── Admin: Set Points ───────────────────
 async def adm_set_points_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     target = _resolve_user(text)
     if not target:
         await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
         return ADM_SET_POINTS_USER
-
     ctx.user_data["adm_target_uid"] = target["user_id"]
     await update.message.reply_text(
-        f"👤 کاربر: {target['first_name']} (موجودی: {target['points']:,}P)\n\nامتیاز جدید را وارد کنید:",
+        f"👤 کاربر: <b>{target['first_name']}</b> (موجودی: {target['points']:,}P)\n\n"
+        "امتیاز جدید را وارد کنید:",
         reply_markup=nav_kb(),
+        parse_mode=ParseMode.HTML,
     )
     return ADM_SET_POINTS_VALUE
 
@@ -1551,23 +1638,21 @@ async def adm_set_points_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 async def adm_set_points_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        ctx.user_data.pop("adm_target_uid", None)
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     try:
         points = int(text.replace(",", ""))
         if points < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ یک عدد مثبت وارد کنید:")
+        await update.message.reply_text("❌ یک عدد صفر یا مثبت وارد کنید:")
         return ADM_SET_POINTS_VALUE
-
     target_uid = ctx.user_data.pop("adm_target_uid", None)
     if not target_uid:
         await update.message.reply_text("❌ خطا. دوباره شروع کنید.", reply_markup=admin_panel_kb())
         return IDLE
-
     set_points(target_uid, points)
     log_admin_action(user.id, "set_points", target_uid, f"points={points}")
     try:
@@ -1583,38 +1668,27 @@ async def adm_set_points_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -
     return IDLE
 
 
-# ─────────────────────────── Admin: Ban ──────────────────────────
 async def adm_ban_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     target = _resolve_user(text)
     if not target:
         await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
         return ADM_BAN_USER
-
     if is_owner(target["user_id"]):
         await update.message.reply_text("❌ نمی‌توان مالک را بن کرد.", reply_markup=admin_panel_kb())
         return IDLE
-
     set_banned(target["user_id"], True)
     log_admin_action(user.id, "ban", target["user_id"])
-
-    # Notify owner if admin did it
     if not is_owner(user.id):
-        owner_id = get_owner_id()
-        if owner_id:
-            try:
-                await ctx.bot.send_message(
-                    owner_id,
-                    f"🚫 ادمین {user.first_name} کاربر {target['first_name']} (ID:{target['user_id']}) را بن کرد.",
-                )
-            except Exception:
-                pass
-
+        await _notify_owner(
+            ctx.bot,
+            f"🚫 ادمین <b>{user.first_name}</b> کاربر <b>{target['first_name']}</b> "
+            f"(ID:{target['user_id']}) را بن کرد."
+        )
     await update.message.reply_text(
         f"🚫 کاربر {target['first_name']} (ID:{target['user_id']}) بن شد.",
         reply_markup=admin_panel_kb(),
@@ -1622,75 +1696,60 @@ async def adm_ban_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return IDLE
 
 
-# ─────────────────────────── Admin: Remove User ──────────────────
 async def adm_remove_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     text = (update.message.text or "").strip()
-    if text in (B_BACK, B_HOME):
-        await update.message.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+    if _admin_back(text):
+        await update.message.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     target = _resolve_user(text)
     if not target:
         await update.message.reply_text("❌ کاربر یافت نشد. دوباره وارد کنید:")
         return ADM_REMOVE_USER
-
     if is_owner(target["user_id"]):
         await update.message.reply_text("❌ نمی‌توان مالک را حذف کرد.", reply_markup=admin_panel_kb())
         return IDLE
-
-    remove_user(target["user_id"])
-    log_admin_action(user.id, "remove_user", target["user_id"])
-
+    saved_name = target["first_name"]
+    saved_id = target["user_id"]
+    remove_user(saved_id)
+    log_admin_action(user.id, "remove_user", saved_id)
     if not is_owner(user.id):
-        owner_id = get_owner_id()
-        if owner_id:
-            try:
-                await ctx.bot.send_message(
-                    owner_id,
-                    f"🗑 ادمین {user.first_name} کاربر {target['first_name']} (ID:{target['user_id']}) را حذف کرد.",
-                )
-            except Exception:
-                pass
-
+        await _notify_owner(
+            ctx.bot,
+            f"🗑 ادمین <b>{user.first_name}</b> کاربر <b>{saved_name}</b> (ID:{saved_id}) را حذف کرد."
+        )
     await update.message.reply_text(
-        f"✅ کاربر {target['first_name']} (ID:{target['user_id']}) حذف شد.\n"
+        f"✅ کاربر {saved_name} (ID:{saved_id}) حذف شد.\n"
         "کاربر می‌تواند با /start بازگردد.",
         reply_markup=admin_panel_kb(),
     )
     return IDLE
 
 
-# ─────────────────────────── Admin: Restore ──────────────────────
 async def adm_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     msg = update.message
-
     if msg.text and msg.text in (B_BACK, B_HOME):
-        await msg.reply_text("🏠 منوی اصلی", reply_markup=main_menu_kb(user.id))
+        await msg.reply_text("⚙️ پنل مدیریت", reply_markup=admin_panel_kb())
         return IDLE
-
     if not msg.document:
         await msg.reply_text("⚠️ لطفاً فایل .db ارسال کنید:", reply_markup=nav_kb())
         return ADM_RESTORE
-
     doc: Document = msg.document
     if not doc.file_name.endswith(".db"):
         await msg.reply_text("❌ فایل باید با پسوند .db باشد.", reply_markup=nav_kb())
         return ADM_RESTORE
-
-    # Download and replace db
     try:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         old_backup = BACKUP_DIR / f"pre_restore_{ts}.db"
-        shutil.copy2(DB_PATH, old_backup)  # Backup current db first
-
+        shutil.copy2(DB_PATH, old_backup)
         tg_file = await ctx.bot.get_file(doc.file_id)
         await tg_file.download_to_drive(str(DB_PATH))
         log_admin_action(user.id, "restore", 0, doc.file_name)
         log.info("Database restored from %s by user %s", doc.file_name, user.id)
         await msg.reply_text(
-            f"✅ <b>بازیابی موفق!</b>\nدیتابیس از فایل <code>{doc.file_name}</code> بازیابی شد.\n"
+            f"✅ <b>بازیابی موفق!</b>\n"
+            f"دیتابیس از <code>{doc.file_name}</code> بازیابی شد.\n"
             f"نسخه قبلی در <code>{old_backup.name}</code> ذخیره شد.",
             reply_markup=admin_panel_kb(),
             parse_mode=ParseMode.HTML,
@@ -1701,28 +1760,10 @@ async def adm_restore(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
     return IDLE
 
 
-# ─────────────────────────── Resolve user helper ─────────────────
-def _resolve_user(text: str) -> Optional[sqlite3.Row]:
-    """Resolve a User ID or @username string to a user row."""
-    text = text.strip().lstrip("@")
-    if text.isdigit():
-        return get_user(int(text))
-    return get_user_by_username(text)
-
-
-# ─────────────────────────── Fallback / cancel ───────────────────
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "🏠 منوی اصلی", reply_markup=main_menu_kb(update.effective_user.id)
-    )
-    return IDLE
-
-
 # ─────────────────────────── Leaderboard auto-reward ─────────────
 def _leaderboard_reward_loop(app_ref: dict) -> None:
-    """Background thread: every 22 days reward top 3.
-    Uses run_coroutine_threadsafe to schedule notifications on PTB's event loop
-    rather than creating a new loop — avoids cross-thread async conflicts."""
+    """Background thread: every 22 days save snapshot + reward top 3.
+    Uses asyncio.run_coroutine_threadsafe with the event loop captured in post_init."""
     CYCLE_DAYS = 22
     BONUS_POINTS = [300, 200, 100]
 
@@ -1739,36 +1780,67 @@ def _leaderboard_reward_loop(app_ref: dict) -> None:
 
             rows = get_leaderboard(3)
             app: Application = app_ref.get("app")
-            if rows and app:
-                for i, row in enumerate(rows):
-                    pts = BONUS_POINTS[i] if i < len(BONUS_POINTS) else 0
-                    add_points(row["user_id"], pts)
-                    try:
-                        # Schedule notification on PTB's running event loop (thread-safe)
-                        future = asyncio.run_coroutine_threadsafe(
-                            app.bot.send_message(
-                                row["user_id"],
-                                f"🏆 <b>جایزه لیدربرد #{i+1}!</b>\n+{pts:,}P به موجودی شما اضافه شد.",
-                                parse_mode=ParseMode.HTML,
-                            ),
-                            app.bot._loop,  # PTB stores the running loop on the bot
-                        )
-                        future.result(timeout=15)
-                    except Exception as e:
-                        log.warning("Leaderboard reward notify failed for %s: %s", row["user_id"], e)
+            loop = app_ref.get("loop")  # captured in post_init via asyncio.get_running_loop()
 
-            set_setting("last_leaderboard_cycle", datetime.now().isoformat())
-            log.info("Leaderboard cycle completed.")
+            if not (rows and app and loop and loop.is_running()):
+                # Loop not ready yet — defer; will retry after next sleep(3600)
+                log.warning("Leaderboard cycle deferred: loop not ready (rows=%s, loop=%s)",
+                             len(rows) if rows else 0, loop)
+                time.sleep(3600)
+                continue
+
+            # Save snapshot before rewarding
+            save_leaderboard_snapshot()
+
+            rewards_ok = True
+            for i, row in enumerate(rows):
+                pts = BONUS_POINTS[i] if i < len(BONUS_POINTS) else 0
+                add_points(row["user_id"], pts)
+                try:
+                    future = asyncio.run_coroutine_threadsafe(
+                        app.bot.send_message(
+                            row["user_id"],
+                            f"🏆 <b>جایزه لیدربرد #{i+1}!</b>\n"
+                            f"+{pts:,}P به موجودی شما اضافه شد.\n"
+                            f"رتبه: <b>#{i+1}</b> از ۲۲ روز گذشته",
+                            parse_mode=ParseMode.HTML,
+                        ),
+                        loop,
+                    )
+                    future.result(timeout=15)
+                except Exception as e:
+                    log.warning("Leaderboard reward notify failed for %s: %s",
+                                row["user_id"], e)
+                    rewards_ok = False
+
+            # Only mark cycle complete after rewards are distributed
+            if rewards_ok:
+                set_setting("last_leaderboard_cycle", datetime.now().isoformat())
+                log.info("Leaderboard 22-day cycle completed.")
+            else:
+                log.warning("Leaderboard cycle had notify failures; cycle NOT marked complete.")
         except Exception as e:
             log.error("Leaderboard reward loop error: %s", e)
         time.sleep(3600)
 
 
 # ─────────────────────────── Bot setup ──────────────────────────
-def build_app() -> Application:
+def build_app(app_ref: dict) -> Application:
+
+    async def _post_init(app: Application) -> None:
+        """Closure: runs after Application init — captures event loop + registers commands.
+        This is the only reliable moment to get the running loop for the leaderboard thread."""
+        app_ref["loop"] = asyncio.get_running_loop()
+        log.info("Event loop captured in post_init.")
+        await app.bot.set_my_commands([
+            BotCommand("start", "شروع / منوی اصلی"),
+        ])
+        log.info("Bot command /start registered.")
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .post_init(_post_init)
         .read_timeout(30)
         .write_timeout(30)
         .connect_timeout(30)
@@ -1779,57 +1851,31 @@ def build_app() -> Application:
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", cmd_start)],
         states={
-            IDLE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, idle_handler),
-            ],
-            REQ_ACTIVITY: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_activity),
-            ],
+            IDLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, idle_handler)],
+            REQ_ACTIVITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_activity)],
             REQ_PROOF: [
                 MessageHandler(
                     (filters.PHOTO | filters.VIDEO | filters.Document.ALL | filters.TEXT)
                     & ~filters.COMMAND,
                     req_proof,
-                ),
+                )
             ],
-            BET_USERNAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bet_username),
-            ],
-            BET_AMOUNT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, bet_amount),
-            ],
-            ADM_ADD_ADMIN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin),
-            ],
-            ADM_REMOVE_ADMIN: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin),
-            ],
-            ADM_BROADCAST: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast),
-            ],
-            ADM_SET_RANK_USER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_rank_user),
-            ],
-            ADM_SET_RANK_VALUE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_rank_value),
-            ],
-            ADM_SET_POINTS_USER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_points_user),
-            ],
-            ADM_SET_POINTS_VALUE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_points_value),
-            ],
-            ADM_BAN_USER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ban_user),
-            ],
-            ADM_REMOVE_USER: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_user),
-            ],
+            BET_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, bet_username)],
+            BET_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, bet_amount)],
+            ADM_ADD_ADMIN:     [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_add_admin)],
+            ADM_REMOVE_ADMIN:  [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_admin)],
+            ADM_BROADCAST:     [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_broadcast)],
+            ADM_SET_RANK_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_rank_user)],
+            ADM_SET_RANK_VALUE:[MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_rank_value)],
+            ADM_SET_POINTS_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_points_user)],
+            ADM_SET_POINTS_VALUE:[MessageHandler(filters.TEXT & ~filters.COMMAND, adm_set_points_value)],
+            ADM_BAN_USER:   [MessageHandler(filters.TEXT & ~filters.COMMAND, adm_ban_user)],
+            ADM_REMOVE_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND, adm_remove_user)],
             ADM_RESTORE: [
                 MessageHandler(
                     (filters.Document.ALL | filters.TEXT) & ~filters.COMMAND,
                     adm_restore,
-                ),
+                )
             ],
         },
         fallbacks=[CommandHandler("start", cmd_start)],
@@ -1840,12 +1886,14 @@ def build_app() -> Application:
 
     app.add_handler(conv)
 
-    # Callback query handlers (outside conversation — work regardless of state)
-    app.add_handler(CallbackQueryHandler(cb_approve, pattern=r"^approve_\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_reject,  pattern=r"^reject_\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_bet_accept,  pattern=r"^bet_accept_\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_bet_reject,  pattern=r"^bet_reject_\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_bet_rematch, pattern=r"^bet_rematch_\d+$"))
+    # Callback query handlers — work regardless of conversation state
+    app.add_handler(CallbackQueryHandler(cb_approve,      pattern=r"^approve_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_reject,       pattern=r"^reject_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_bet_accept,   pattern=r"^bet_accept_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_bet_reject,   pattern=r"^bet_reject_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_bet_rematch,  pattern=r"^bet_rematch_\d+$"))
+    app.add_handler(CallbackQueryHandler(cb_reset_confirm,pattern=r"^reset_pts_confirm$"))
+    app.add_handler(CallbackQueryHandler(cb_reset_cancel, pattern=r"^reset_pts_cancel$"))
 
     return app
 
@@ -1869,20 +1917,25 @@ def main() -> None:
     app_ref: dict = {}
 
     while True:
-        log.info("━━━ Bot start attempt #%d (fails=%d) ━━━", consecutive_fails + 1, consecutive_fails)
+        log.info("━━━ Bot start attempt #%d (fails=%d) ━━━",
+                 consecutive_fails + 1, consecutive_fails)
         try:
-            app = build_app()
+            app = build_app(app_ref)
             app_ref["app"] = app
 
-            # Start leaderboard reward thread once
+            # Start leaderboard reward background thread (daemon, started once)
             if not app_ref.get("reward_thread_started"):
-                t = threading.Thread(target=_leaderboard_reward_loop, args=(app_ref,), daemon=True)
+                t = threading.Thread(
+                    target=_leaderboard_reward_loop, args=(app_ref,), daemon=True, name="lb_reward"
+                )
                 t.start()
                 app_ref["reward_thread_started"] = True
 
             log.info("Bot is now polling…")
+            # Loop is captured inside post_init (asyncio.get_running_loop()) which fires
+            # after the Application event loop is started — do NOT set it here.
             app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-            consecutive_fails = 0
+            consecutive_fails = 0  # reset only after clean exit
 
         except InvalidToken:
             log.critical("InvalidToken — check BOT_TOKEN secret. Exiting.")
@@ -1890,7 +1943,8 @@ def main() -> None:
 
         except Conflict:
             consecutive_fails += 1
-            log.error("Conflict 409 — another instance running. Waiting 15s… (fail #%d)", consecutive_fails)
+            log.error("Conflict 409 — another instance running. Waiting 15s… (fail #%d)",
+                      consecutive_fails)
             time.sleep(15)
 
         except NetworkError as e:
@@ -1906,7 +1960,8 @@ def main() -> None:
         except Exception as e:
             consecutive_fails += 1
             wait = min(5 * consecutive_fails, 120)
-            log.exception("Unhandled exception (fail #%d) — retry in %ds: %s", consecutive_fails, wait, e)
+            log.exception("Unhandled exception (fail #%d) — retry in %ds: %s",
+                          consecutive_fails, wait, e)
             if consecutive_fails >= MAX_FAILS:
                 log.critical("Too many consecutive failures (%d). Exiting.", consecutive_fails)
                 sys.exit(1)
